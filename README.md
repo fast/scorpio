@@ -1,6 +1,6 @@
-# Fast template for developing a new Rust project
+# Scorpio
 
-Use this repository as a GitHub template to quickly start a new Rust project.
+A scheduler independent asynchronous context.
 
 ## License
 

@@ -1,4 +1,4 @@
-# Copyright 2025 FastLabs Developers
+# Copyright 2025 tison <wander4096@gmail.com>
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -53,7 +53,7 @@ jobs:
     strategy:
       matrix:
         os: [ ubuntu-22.04, macos-14, windows-2022 ]
-        rust-version: [ "1.80.0", "stable" ]
+        rust-version: [ "1.85.0", "stable" ]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
