@@ -12,12 +12,20 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! An xtask binary for managing workspace tasks.
+
+use std::path::Path;
 use std::process::Command as StdCommand;
 
 use clap::Parser;
 use clap::Subcommand;
 
+fn workspace_dir() -> &'static Path {
+    Path::new(env!("CARGO_WORKSPACE_DIR"))
+}
+
 #[derive(Parser)]
+#[clap(about = "Run repository tasks.")]
 struct Command {
     #[clap(subcommand)]
     sub: SubCommand,
@@ -35,11 +43,11 @@ impl Command {
 
 #[derive(Subcommand)]
 enum SubCommand {
-    #[clap(about = "Compile workspace packages.")]
+    #[clap(about = "Compile all workspace targets.")]
     Build(CommandBuild),
-    #[clap(about = "Run format and clippy checks.")]
+    #[clap(about = "Run workspace quality checks.")]
     Lint(CommandLint),
-    #[clap(about = "Run unit tests.")]
+    #[clap(about = "Run workspace unit tests.")]
     Test(CommandTest),
 }
 
@@ -63,14 +71,14 @@ struct CommandTest {
 
 impl CommandTest {
     fn run(self) {
-        run_command(make_test_cmd(self.no_capture, true, &[]));
+        run_command(make_test_cmd(self.no_capture, &[]));
     }
 }
 
 #[derive(Parser)]
 #[clap(name = "lint")]
 struct CommandLint {
-    #[arg(long, help = "Automatically apply lint suggestions.")]
+    #[arg(long, help = "Automatically apply available lint and format fixes.")]
     fix: bool,
 }
 
@@ -81,6 +89,7 @@ impl CommandLint {
         run_command(make_taplo_cmd(self.fix));
         run_command(make_typos_cmd());
         run_command(make_hawkeye_cmd(self.fix));
+        run_command(make_doc_cmd());
     }
 }
 
@@ -88,7 +97,7 @@ fn find_command(cmd: &str) -> StdCommand {
     match which::which(cmd) {
         Ok(exe) => {
             let mut cmd = StdCommand::new(exe);
-            cmd.current_dir(env!("CARGO_WORKSPACE_DIR"));
+            cmd.current_dir(workspace_dir());
             cmd
         }
         Err(err) => {
@@ -128,12 +137,9 @@ fn make_build_cmd(locked: bool) -> StdCommand {
     cmd
 }
 
-fn make_test_cmd(no_capture: bool, default_features: bool, features: &[&str]) -> StdCommand {
+fn make_test_cmd(no_capture: bool, features: &[&str]) -> StdCommand {
     let mut cmd = find_command("cargo");
-    cmd.args(["test", "--workspace"]);
-    if !default_features {
-        cmd.arg("--no-default-features");
-    }
+    cmd.args(["test", "--workspace", "--no-default-features"]);
     if !features.is_empty() {
         cmd.args(["--features", features.join(",").as_str()]);
     }
@@ -145,7 +151,7 @@ fn make_test_cmd(no_capture: bool, default_features: bool, features: &[&str]) ->
 
 fn make_format_cmd(fix: bool) -> StdCommand {
     let mut cmd = find_command("cargo");
-    cmd.args(["fmt", "--all"]);
+    cmd.args(["+nightly", "fmt", "--all"]);
     if !fix {
         cmd.arg("--check");
     }
@@ -155,6 +161,7 @@ fn make_format_cmd(fix: bool) -> StdCommand {
 fn make_clippy_cmd(fix: bool) -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.args([
+        "+nightly",
         "clippy",
         "--tests",
         "--all-features",
@@ -166,6 +173,19 @@ fn make_clippy_cmd(fix: bool) -> StdCommand {
     } else {
         cmd.args(["--", "-D", "warnings"]);
     }
+    cmd
+}
+
+fn make_doc_cmd() -> StdCommand {
+    let mut cmd = find_command("cargo");
+    cmd.env("RUSTDOCFLAGS", "-D warnings --cfg docsrs");
+    cmd.args([
+        "+nightly",
+        "doc",
+        "--workspace",
+        "--all-features",
+        "--no-deps",
+    ]);
     cmd
 }
 
