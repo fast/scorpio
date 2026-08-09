@@ -30,6 +30,12 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
+mea = { version = "0.6.5" }
+slab = { version = "0.4.11" }
+
+[dev-dependencies]
+loom = { version = "0.7.2" }
+pollster = { version = "1.0.1" }
 
 [lints]
 workspace = true
