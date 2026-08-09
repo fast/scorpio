@@ -12,6 +12,38 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-pub fn hello() {
-    println!("Hello, world!");
+#![deny(missing_docs)]
+
+//! `scorpio` is a scheduler-independent asynchronous context.
+//!
+//! # Features
+//!
+//! * [`time`]: Explicitly driven delays, timeouts, intervals, and scheduled actions. Its driver is
+//!   intended to be owned by an integrating asynchronous context; it starts no thread and does not
+//!   rely on a process-global or thread-local runtime handle.
+
+pub mod time;
+
+#[cfg(test)]
+mod tests {
+    use crate::time::Delay;
+    use crate::time::Interval;
+    use crate::time::TimerContext;
+    use crate::time::TimerDriver;
+
+    #[test]
+    fn assert_send_and_sync() {
+        fn do_assert_send_and_sync<T: Send + Sync>() {}
+        do_assert_send_and_sync::<TimerContext>();
+        do_assert_send_and_sync::<TimerDriver>();
+        do_assert_send_and_sync::<Delay>();
+        do_assert_send_and_sync::<Interval>();
+    }
+
+    #[test]
+    fn assert_unpin() {
+        fn do_assert_unpin<T: Unpin>() {}
+        do_assert_unpin::<Delay>();
+        do_assert_unpin::<Interval>();
+    }
 }
