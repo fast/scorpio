@@ -16,7 +16,9 @@
 //!
 //! [`TimerDriver`] owns time advancement. It starts no thread and opens no I/O resource; an event
 //! loop calls [`TimerDriver::turn`] and uses [`TimerDriver::next_poll_at`] to choose its next poll
-//! deadline. Tasks receive a cloneable [`TimerContext`] and create lazy [`Delay`] futures from it.
+//! deadline. Tasks receive a cloneable [`TimerContext`] directly or as an optional capability in
+//! an explicitly constructed [`IoContext`](crate::IoContext), then create lazy [`Delay`] futures
+//! from it.
 //!
 //! # Reactor contract
 //!
@@ -88,7 +90,6 @@ use std::num::NonZeroUsize;
 use std::ops::AsyncFnMut;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::OnceLock;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
@@ -101,9 +102,9 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-use mea::atomicbox::AtomicOptionBox;
-use mea::mpsc;
-use mea::mpsc::TryRecvError;
+use atomic_waker::AtomicWaker;
+use crossbeam_channel as mpsc;
+use crossbeam_channel::TryRecvError;
 
 use crate::time::wheel::Deadline;
 use crate::time::wheel::Step;
@@ -201,14 +202,14 @@ enum ClockMode {
 
 struct DriverWake {
     pending: AtomicBool,
-    slot: AtomicOptionBox<Waker>,
+    slot: AtomicWaker,
 }
 
 impl DriverWake {
     fn new() -> Self {
         Self {
             pending: AtomicBool::new(false),
-            slot: AtomicOptionBox::none(),
+            slot: AtomicWaker::new(),
         }
     }
 
@@ -216,22 +217,15 @@ impl DriverWake {
         // ORDERING: Paired with `mark_empty`; the completed channel send precedes this fence.
         fence(Ordering::SeqCst);
         let first = !self.pending.swap(true, Ordering::AcqRel);
-        // ORDERING: Paired with `arm`; the pending publication precedes this fence. It remains
-        // unconditional because a producer that finds `pending` set can race a concurrent clear.
-        fence(Ordering::SeqCst);
-        if !first {
-            return;
-        }
-        if let Some(waker) = self.slot.take() {
-            waker.wake();
+        if first {
+            self.slot.wake();
         }
     }
 
     fn arm(&self, waker: &Waker) -> bool {
-        self.slot.store(Some(Box::new(waker.clone())));
-        // ORDERING: Paired with `notify_after_send`; acquire/release on separate atomics is
-        // insufficient.
-        fence(Ordering::SeqCst);
+        // AtomicWaker coordinates registration with a concurrent wake. Register before checking
+        // `pending` so either this check observes the operation or its producer observes the slot.
+        self.slot.register(waker);
         if self.pending.load(Ordering::Acquire) {
             drop(self.slot.take());
             false
@@ -279,17 +273,24 @@ impl AtomicObservation {
         // ORDERING: The location publishes no other state, so per-location coherence alone gives
         // every reader a monotonically non-decreasing observation.
         let nanos = self.nanos.load(Ordering::Relaxed);
-        self.genesis
-            .checked_add(Duration::from_nanos(nanos))
-            .expect("published observation must remain representable")
+        self.decode(nanos)
     }
 
     fn store(&self, observation: Instant) {
-        let elapsed = observation.duration_since(self.genesis);
         // ORDERING: Only the driver stores here, and readers synchronize with timer completions
         // through `TimerState`, never through this value.
         self.nanos
-            .store(encode_observation_nanos(elapsed), Ordering::Relaxed);
+            .store(self.encode(observation), Ordering::Relaxed);
+    }
+
+    fn encode(&self, observation: Instant) -> u64 {
+        encode_observation_nanos(observation.duration_since(self.genesis))
+    }
+
+    fn decode(&self, nanos: u64) -> Instant {
+        self.genesis
+            .checked_add(Duration::from_nanos(nanos))
+            .expect("published observation must remain representable")
     }
 }
 
@@ -301,6 +302,7 @@ struct Shared {
     clock_mode: ClockMode,
     closed: AtomicBool,
     observed: AtomicObservation,
+    sender: mpsc::Sender<Operation>,
     wake: DriverWake,
 }
 
@@ -314,62 +316,37 @@ impl Shared {
     }
 }
 
-struct DelayWakeSlot(AtomicOptionBox<Waker>);
-
-impl DelayWakeSlot {
-    fn new() -> Self {
-        Self(AtomicOptionBox::none())
-    }
-
-    fn register_and_load(&self, waker: &Waker, lifecycle: &AtomicU8) -> u8 {
-        self.0.store(Some(Box::new(waker.clone())));
-        // ORDERING: Paired with `take_after_publish`; both sides may not miss the other's store.
-        fence(Ordering::SeqCst);
-        lifecycle.load(Ordering::Acquire)
-    }
-
-    fn take_after_publish(&self) -> Option<Waker> {
-        // ORDERING: Paired with `register_and_load`; the lifecycle transition precedes this fence.
-        fence(Ordering::SeqCst);
-        self.0.take().map(|waker| *waker)
-    }
-
-    fn clear(&self) {
-        drop(self.0.take());
-    }
-}
-
 struct TimerState {
     // Written before publishing `STATE_FIRED` and read only after observing it.
-    fired_at: OnceLock<Instant>,
+    fired_nanos: AtomicU64,
     lifecycle: AtomicU8,
     // Only the driver accesses this reclamation hint. Atomic interior mutability keeps the shared
     // state `Sync`; the driver validates a non-sentinel value with `Arc::ptr_eq` before using it.
     slot: AtomicUsize,
-    waker: DelayWakeSlot,
+    waker: AtomicWaker,
 }
 
 impl TimerState {
     fn new() -> Self {
         Self {
-            fired_at: OnceLock::new(),
+            fired_nanos: AtomicU64::new(0),
             lifecycle: AtomicU8::new(STATE_SUBMITTED),
             slot: AtomicUsize::new(NO_SLOT),
-            waker: DelayWakeSlot::new(),
+            waker: AtomicWaker::new(),
         }
     }
 
     fn publish_terminal(&self, from: u8, to: u8) -> Option<Waker> {
-        // ORDERING: The release half publishes terminal payload such as `fired_at` to a polling
+        // ORDERING: The release half publishes terminal payload such as `fired_nanos` to a polling
         // task's acquire lifecycle load. The acquire half observes the preceding registration
-        // publication before replacing it. Waker transfer is ordered separately by
-        // `DelayWakeSlot`'s fence pair.
+        // publication before replacing it. AtomicWaker separately coordinates a concurrent
+        // register/take pair.
         if self
             .lifecycle
             .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.waker.take_after_publish()
+            self.waker.take()
         } else {
             None
         }
@@ -410,7 +387,6 @@ enum Operation {
 /// See the [module level documentation](self) for the driver and reactor integration model.
 #[derive(Clone)]
 pub struct TimerContext {
-    sender: mpsc::UnboundedSender<Operation>,
     shared: Arc<Shared>,
 }
 
@@ -421,6 +397,15 @@ impl fmt::Debug for TimerContext {
 }
 
 impl TimerContext {
+    /// Returns this timer capability's current clock observation.
+    ///
+    /// A system-clock context returns the later of [`Instant::now`] and the driver's last
+    /// observation. A context created by [`TimerDriver::new_at`] advances only when its driver is
+    /// turned.
+    pub fn now(&self) -> Instant {
+        self.shared.observation()
+    }
+
     /// Creates a lazy delay that completes at or after `deadline`.
     pub fn delay_until(&self, deadline: Instant) -> Delay {
         self.delay_to(Deadline::At(deadline))
@@ -439,17 +424,12 @@ impl TimerContext {
             deadline,
             closed: false,
             fired_at: None,
-            registered_waker: None,
             state: None,
         }
     }
 
-    fn now(&self) -> Instant {
-        self.shared.observation()
-    }
-
     fn send(&self, operation: Operation) -> Result<(), Operation> {
-        match self.sender.send(operation) {
+        match self.shared.sender.send(operation) {
             Ok(()) => {
                 self.shared.wake.notify_after_send();
                 Ok(())
@@ -468,7 +448,7 @@ impl TimerContext {
 pub struct TimerDriver {
     last_now: Instant,
     prefer_non_immediate: bool,
-    receiver: Option<mpsc::UnboundedReceiver<Operation>>,
+    receiver: Option<mpsc::Receiver<Operation>>,
     shared: Arc<Shared>,
     wheel: Wheel<Arc<TimerState>>,
 }
@@ -507,10 +487,10 @@ impl TimerDriver {
             clock_mode,
             closed: AtomicBool::new(false),
             observed: AtomicObservation::new(genesis),
+            sender,
             wake: DriverWake::new(),
         });
         let context = TimerContext {
-            sender,
             shared: shared.clone(),
         };
         let driver = Self {
@@ -652,9 +632,13 @@ impl TimerDriver {
             return;
         }
 
-        let id = self.wheel.insert(deadline, now, state.clone());
-        state.slot.store(id, Ordering::Relaxed);
-        if state
+        let id = self.wheel.insert(deadline, now, state);
+        let registered = self
+            .wheel
+            .get(id)
+            .expect("inserted timer must remain linked in the wheel");
+        registered.slot.store(id, Ordering::Relaxed);
+        let cancelled = registered
             .lifecycle
             .compare_exchange(
                 STATE_SUBMITTED,
@@ -662,9 +646,9 @@ impl TimerDriver {
                 Ordering::AcqRel,
                 Ordering::Acquire,
             )
-            .is_err()
-        {
-            state.slot.store(NO_SLOT, Ordering::Relaxed);
+            .is_err();
+        if cancelled {
+            registered.slot.store(NO_SLOT, Ordering::Relaxed);
             self.wheel.remove(id);
         }
     }
@@ -687,22 +671,19 @@ impl TimerDriver {
     fn fire(&mut self, id: usize, now: Instant) {
         let state = self
             .wheel
-            .get(id)
-            .cloned()
+            .remove(id)
             .expect("ready timer must remain linked in the wheel");
         state
-            .fired_at
-            .set(now)
-            .expect("timer completion observation must be published once");
+            .fired_nanos
+            .store(self.shared.observed.encode(now), Ordering::Relaxed);
         let waker = state.publish_terminal(STATE_REGISTERED, STATE_FIRED);
         state.slot.store(NO_SLOT, Ordering::Relaxed);
-        self.wheel.remove(id);
         if let Some(waker) = waker {
             waker.wake();
         }
     }
 
-    fn receiver_mut(&mut self) -> &mut mpsc::UnboundedReceiver<Operation> {
+    fn receiver_mut(&mut self) -> &mut mpsc::Receiver<Operation> {
         self.receiver.as_mut().expect("timer receiver must be live")
     }
 }
@@ -748,7 +729,6 @@ pub struct Delay {
     deadline: Deadline,
     closed: bool,
     fired_at: Option<Instant>,
-    registered_waker: Option<Waker>,
     state: Option<Arc<TimerState>>,
 }
 
@@ -776,21 +756,15 @@ impl Delay {
         match lifecycle {
             STATE_FIRED => {
                 let state = self.state.take().expect("polled delay must have state");
-                state.waker.clear();
-                self.fired_at = Some(
-                    *state
-                        .fired_at
-                        .get()
-                        .expect("fired delay must have a completion observation"),
-                );
-                self.registered_waker = None;
+                drop(state.waker.take());
+                let nanos = state.fired_nanos.load(Ordering::Relaxed);
+                self.fired_at = Some(self.context.shared.observed.decode(nanos));
                 Poll::Ready(Ok(()))
             }
             STATE_CLOSED => {
                 let state = self.state.take().expect("polled delay must have state");
-                state.waker.clear();
+                drop(state.waker.take());
                 self.closed = true;
-                self.registered_waker = None;
                 Poll::Ready(Err(TimerClosed))
             }
             STATE_SUBMITTED | STATE_REGISTERED => Poll::Pending,
@@ -825,8 +799,7 @@ impl Future for Delay {
             }
 
             let state = Arc::new(TimerState::new());
-            state.waker.register_and_load(cx.waker(), &state.lifecycle);
-            this.registered_waker = Some(cx.waker().clone());
+            state.waker.register(cx.waker());
             this.state = Some(state.clone());
             let operation = Operation::Register(RegisterOp {
                 deadline: this.deadline,
@@ -851,22 +824,8 @@ impl Future for Delay {
         }
 
         let state = this.state.as_ref().expect("polled delay must have state");
-        let lifecycle = if this
-            .registered_waker
-            .as_ref()
-            .is_some_and(|registered| registered.will_wake(cx.waker()))
-        {
-            // ORDERING: The shared slot still holds an equivalent waker from an earlier poll, so
-            // there is nothing to publish and no fence to pair. A non-terminal lifecycle implies
-            // the slot is still armed: the driver empties it only in `take_after_publish`, which
-            // happens after the terminal transition, and `poll_lifecycle` clears it only on a
-            // terminal state. Skipping the store avoids boxing a waker clone on every repoll.
-            state.lifecycle.load(Ordering::Acquire)
-        } else {
-            let lifecycle = state.waker.register_and_load(cx.waker(), &state.lifecycle);
-            this.registered_waker = Some(cx.waker().clone());
-            lifecycle
-        };
+        state.waker.register(cx.waker());
+        let lifecycle = state.lifecycle.load(Ordering::Acquire);
         this.poll_lifecycle(lifecycle)
     }
 }
@@ -889,7 +848,7 @@ impl Drop for Delay {
                         )
                         .is_ok()
                     {
-                        state.waker.clear();
+                        drop(state.waker.take());
                         return;
                     }
                 }
@@ -904,7 +863,7 @@ impl Drop for Delay {
                         )
                         .is_ok()
                     {
-                        state.waker.clear();
+                        drop(state.waker.take());
                         let _ = self.context.send(Operation::Cancel(state.clone()));
                         return;
                     }

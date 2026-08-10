@@ -18,6 +18,25 @@
 
 A scheduler independent asynchronous context.
 
+Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications explicitly construct an `IoContext` from the capabilities they need, pass it through their own task boundaries, and keep the corresponding reactor drivers under their control.
+
+```rust
+use scorpio::IoContext;
+use scorpio::time::TimerDriver;
+
+let (timer_driver, timer) = TimerDriver::new();
+let io = IoContext::new().with_timer(timer);
+
+assert!(io.timer().is_some());
+drop(timer_driver);
+```
+
+The ownership and timing-wheel tradeoffs are documented in [Timer context design](docs/timer-design.md). Run `cargo x bench --quick` for a benchmark smoke test, or use `cargo x bench --save-baseline NAME` and `cargo x bench --baseline NAME` for a before/after performance regression comparison.
+
+## Acknowledgements
+
+The initial `time` module is adapted from [fast/mea#137](https://github.com/fast/mea/pull/137), authored by [Orthur](https://github.com/orthur2) (`Orthur <orthur2@gmail.com>`, original commit [`5476e10`](https://github.com/fast/mea/commit/5476e1006fc80729f8e646f70aba1091fde72386)).
+
 ## Minimum Rust version policy
 
 This crate's minimum supported `rustc` version is `1.85.0`.

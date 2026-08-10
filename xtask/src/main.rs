@@ -34,6 +34,7 @@ struct Command {
 impl Command {
     fn run(self) {
         match self.sub {
+            SubCommand::Bench(cmd) => cmd.run(),
             SubCommand::Build(cmd) => cmd.run(),
             SubCommand::Lint(cmd) => cmd.run(),
             SubCommand::Test(cmd) => cmd.run(),
@@ -43,12 +44,72 @@ impl Command {
 
 #[derive(Subcommand)]
 enum SubCommand {
+    #[clap(about = "Run timer performance benchmarks.")]
+    Bench(CommandBench),
     #[clap(about = "Compile all workspace targets.")]
     Build(CommandBuild),
     #[clap(about = "Run workspace quality checks.")]
     Lint(CommandLint),
     #[clap(about = "Run workspace unit tests.")]
     Test(CommandTest),
+}
+
+#[derive(Parser)]
+struct CommandBench {
+    #[arg(
+        value_name = "FILTER",
+        help = "Run benchmarks whose names contain this text."
+    )]
+    filter: Option<String>,
+    #[arg(long, help = "Stop sampling once statistical significance is reached.")]
+    quick: bool,
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "baseline",
+        help = "Save results as a named regression baseline."
+    )]
+    save_baseline: Option<String>,
+    #[arg(
+        long,
+        value_name = "NAME",
+        conflicts_with = "save_baseline",
+        help = "Compare results with a named regression baseline."
+    )]
+    baseline: Option<String>,
+}
+
+impl CommandBench {
+    fn run(self) {
+        const ISOLATED_FILTERS: [&str; 7] = [
+            "timer/frontend_lifecycle/scorpio",
+            "timer/frontend_lifecycle/tokio",
+            "timer/frontend_lifecycle/async_io",
+            "timer/frontend_lifecycle/futures_timer",
+            "timer/scorpio_driver",
+            "timer/expire_registered/scorpio_",
+            "timer/expire_registered/tokio_runtime",
+        ];
+
+        if let Some(filter) = self.filter.as_deref() {
+            run_command(make_bench_cmd(
+                Some(filter),
+                self.quick,
+                self.save_baseline.as_deref(),
+                self.baseline.as_deref(),
+            ));
+            return;
+        }
+
+        for filter in ISOLATED_FILTERS {
+            run_command(make_bench_cmd(
+                Some(filter),
+                self.quick,
+                self.save_baseline.as_deref(),
+                self.baseline.as_deref(),
+            ));
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -133,6 +194,29 @@ fn make_build_cmd(locked: bool) -> StdCommand {
     ]);
     if locked {
         cmd.arg("--locked");
+    }
+    cmd
+}
+
+fn make_bench_cmd(
+    filter: Option<&str>,
+    quick: bool,
+    save_baseline: Option<&str>,
+    baseline: Option<&str>,
+) -> StdCommand {
+    let mut cmd = find_command("cargo");
+    cmd.args(["bench", "--workspace", "--bench", "timer", "--"]);
+    if let Some(filter) = filter {
+        cmd.arg(filter);
+    }
+    if quick {
+        cmd.arg("--quick");
+    }
+    if let Some(baseline) = save_baseline {
+        cmd.args(["--save-baseline", baseline]);
+    }
+    if let Some(baseline) = baseline {
+        cmd.args(["--baseline", baseline]);
     }
     cmd
 }
