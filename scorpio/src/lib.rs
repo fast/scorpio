@@ -29,13 +29,13 @@ mod tests {
     use crate::time::Delay;
     use crate::time::Interval;
     use crate::time::TimerContext;
-    use crate::time::TimerDriver;
+    use crate::time::TimerService;
 
     #[test]
     fn assert_send_and_sync() {
         fn do_assert_send_and_sync<T: Send + Sync>() {}
         do_assert_send_and_sync::<TimerContext>();
-        do_assert_send_and_sync::<TimerDriver>();
+        do_assert_send_and_sync::<TimerService>();
         do_assert_send_and_sync::<Delay>();
         do_assert_send_and_sync::<Interval>();
     }

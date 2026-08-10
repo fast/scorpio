@@ -14,18 +14,19 @@
 
 //! Explicitly driven timer primitives for Scorpio's asynchronous context.
 //!
-//! [`TimerDriver`] owns time advancement. It starts no thread and opens no I/O resource; an event
-//! loop calls [`TimerDriver::turn`] and uses [`TimerDriver::next_poll_at`] to choose its next poll
-//! deadline. Tasks receive a cloneable [`TimerContext`] and create lazy [`Delay`] futures from it.
+//! [`TimerService`] owns time advancement. It starts no thread and opens no I/O resource; an event
+//! loop calls [`TimerService::turn`] and uses [`TimerService::next_poll_at`] to choose its next
+//! poll deadline. Tasks receive a cloneable [`TimerContext`] and create lazy [`Delay`] futures from
+//! it.
 //!
 //! # Reactor contract
 //!
 //! After each timer turn, the integrating event loop must:
 //!
 //! 1. use a zero timeout when [`TurnResult::has_more_work`] is true;
-//! 2. otherwise call [`TimerDriver::register_wake`] before parking and use a zero timeout if it
+//! 2. otherwise call [`TimerService::register_wake`] before parking and use a zero timeout if it
 //!    returns `false`;
-//! 3. only after a successful registration, read [`TimerDriver::next_poll_at`] and calculate the
+//! 3. only after a successful registration, read [`TimerService::next_poll_at`] and calculate the
 //!    timeout against a fresh clock observation.
 //!
 //! Even when timer work remains, the reactor should perform one non-blocking I/O poll and dispatch
@@ -34,7 +35,7 @@
 //! # Operation backlog and cancellation
 //!
 //! Registrations and cancellations use an unbounded operation queue. One turn processes at most
-//! [`TurnBudget::max_operations`] messages. When producers outpace the driver, operations remain
+//! [`TurnBudget::max_operations`] messages. When producers outpace the service, operations remain
 //! queued instead of being rejected for capacity, so the reactor must keep taking non-blocking
 //! turns while [`TurnResult::has_more_work`] is true.
 //!
@@ -45,7 +46,7 @@
 //!
 //! # Resolution
 //!
-//! The driver uses a 1 ms scheduling resolution. Future deadlines are rounded up to the next tick,
+//! The service uses a 1 ms scheduling resolution. Future deadlines are rounded up to the next tick,
 //! so a timer never fires early because of wheel rounding, but may become ready up to one tick
 //! after its requested deadline in addition to any reactor wake-up delay.
 //!
@@ -60,27 +61,28 @@
 //! use std::time::Duration;
 //! use std::time::Instant;
 //!
-//! use scorpio::time::TimerDriver;
+//! use scorpio::time::TimerService;
 //! use scorpio::time::TurnBudget;
 //!
 //! let start = Instant::now();
 //! let deadline = start + Duration::from_millis(10);
-//! let (mut driver, timer) = TimerDriver::new_at(start);
+//! let (mut service, timer) = TimerService::new_at(start);
 //! let mut delay = pin!(timer.delay_until(deadline));
 //! let mut cx = Context::from_waker(Waker::noop());
 //!
 //! assert!(delay.as_mut().poll(&mut cx).is_pending());
 //! // The first poll queued a registration, so a reactor may not park yet.
-//! assert!(!driver.register_wake(Waker::noop()));
-//! assert!(!driver.turn(start, TurnBudget::default()).has_more_work());
+//! assert!(!service.register_wake(Waker::noop()));
+//! assert!(!service.turn(start, TurnBudget::default()).has_more_work());
 //!
 //! // With the queue drained, the reactor can arm its wake and use the timer deadline.
-//! assert!(driver.register_wake(Waker::noop()));
-//! assert_eq!(driver.next_poll_at(), Some(deadline));
-//! let _ = driver.turn(start + Duration::from_millis(10), TurnBudget::default());
+//! assert!(service.register_wake(Waker::noop()));
+//! assert_eq!(service.next_poll_at(), Some(deadline));
+//! let _ = service.turn(start + Duration::from_millis(10), TurnBudget::default());
 //! assert!(matches!(delay.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
 //! ```
 
+use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
 use std::future::poll_fn;
@@ -88,6 +90,7 @@ use std::num::NonZeroUsize;
 use std::ops::AsyncFnMut;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
@@ -101,8 +104,6 @@ use std::time::Duration;
 use std::time::Instant;
 
 use mea::atomicbox::AtomicOptionBox;
-use mea::mpsc;
-use mea::mpsc::TryRecvError;
 
 use crate::time::wheel::Deadline;
 use crate::time::wheel::Step;
@@ -112,20 +113,20 @@ use crate::time::wheel::Wheel;
 mod tests;
 mod wheel;
 
-/// The delay submitted a registration, but the driver has not published it as registered.
+/// The delay submitted a registration, but the service has not published it as registered.
 const STATE_SUBMITTED: u8 = 0;
-/// The driver has linked the timer into its wheel.
+/// The service has linked the timer into its wheel.
 const STATE_REGISTERED: u8 = 1;
-/// The driver reached the deadline and published the completion observation.
+/// The service reached the deadline and published the completion observation.
 const STATE_FIRED: u8 = 2;
 /// The delay was dropped before it completed.
 const STATE_CANCELLED: u8 = 3;
-/// The backing driver closed before it completed.
+/// The backing service closed before it completed.
 const STATE_CLOSED: u8 = 4;
 /// Sentinel indicating that a timer state has no live wheel entry.
 const NO_SLOT: usize = usize::MAX;
 
-/// Work admitted during one [`TimerDriver::turn`].
+/// Work admitted during one [`TimerService::turn`].
 ///
 /// The default admits up to 1,024 operation-queue messages and 4,096 timer entries per turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -163,7 +164,7 @@ impl Default for TurnBudget {
     }
 }
 
-/// The result of one [`TimerDriver::turn`].
+/// The result of one [`TimerService::turn`].
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 #[must_use = "the reactor must inspect whether timer work remains"]
 pub struct TurnResult {
@@ -180,13 +181,13 @@ impl TurnResult {
     }
 }
 
-/// Error returned when the driver backing a timer context has been dropped.
+/// Error returned when the service backing a timer context has been dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerClosed;
 
 impl fmt::Display for TimerClosed {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("timer driver is closed")
+        f.write_str("timer service is closed")
     }
 }
 
@@ -198,69 +199,103 @@ enum ClockMode {
     Driven,
 }
 
-struct DriverWake {
-    pending: AtomicBool,
-    slot: AtomicOptionBox<Waker>,
+struct OperationQueue {
+    inner: Mutex<OperationQueueInner>,
 }
 
-impl DriverWake {
+struct OperationQueueInner {
+    accepting: bool,
+    operations: VecDeque<Operation>,
+    reactor_waker: Option<Waker>,
+}
+
+impl OperationQueue {
     fn new() -> Self {
         Self {
-            pending: AtomicBool::new(false),
-            slot: AtomicOptionBox::none(),
+            inner: Mutex::new(OperationQueueInner {
+                accepting: true,
+                operations: VecDeque::new(),
+                reactor_waker: None,
+            }),
         }
     }
 
-    fn notify_after_send(&self) {
-        // ORDERING: Paired with `mark_empty`; the completed channel send precedes this fence.
-        fence(Ordering::SeqCst);
-        let first = !self.pending.swap(true, Ordering::AcqRel);
-        // ORDERING: Paired with `arm`; the pending publication precedes this fence. It remains
-        // unconditional because a producer that finds `pending` set can race a concurrent clear.
-        fence(Ordering::SeqCst);
-        if !first {
-            return;
-        }
-        if let Some(waker) = self.slot.take() {
+    fn send(&self, operation: Operation) -> Result<(), Operation> {
+        let waker = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.accepting {
+                return Err(operation);
+            }
+            let first = inner.operations.is_empty();
+            inner.operations.push_back(operation);
+            first.then(|| inner.reactor_waker.take()).flatten()
+        };
+        if let Some(waker) = waker {
             waker.wake();
         }
+        Ok(())
     }
 
     fn arm(&self, waker: &Waker) -> bool {
-        self.slot.store(Some(Box::new(waker.clone())));
-        // ORDERING: Paired with `notify_after_send`; acquire/release on separate atomics is
-        // insufficient.
-        fence(Ordering::SeqCst);
-        if self.pending.load(Ordering::Acquire) {
-            drop(self.slot.take());
-            false
+        // Clone before locking because a custom RawWaker vtable may panic. Replaced wakers are also
+        // dropped after unlocking so no user-provided vtable code runs in the queue critical path.
+        let mut replacement = Some(waker.clone());
+        let (armed, previous) = {
+            let mut inner = self.inner.lock().unwrap();
+            if !inner.operations.is_empty() || !inner.accepting {
+                (false, inner.reactor_waker.take())
+            } else if inner
+                .reactor_waker
+                .as_ref()
+                .is_some_and(|registered| registered.will_wake(waker))
+            {
+                (true, None)
+            } else {
+                (
+                    true,
+                    inner
+                        .reactor_waker
+                        .replace(replacement.take().expect("replacement waker must exist")),
+                )
+            }
+        };
+        drop(previous);
+        drop(replacement);
+        armed
+    }
+
+    fn drain_into(&self, limit: usize, target: &mut VecDeque<Operation>) {
+        debug_assert!(target.is_empty());
+        let mut inner = self.inner.lock().unwrap();
+        let count = limit.min(inner.operations.len());
+        if count == inner.operations.len() {
+            std::mem::swap(target, &mut inner.operations);
         } else {
-            true
+            target.extend(inner.operations.drain(..count));
         }
     }
 
-    fn mark_empty(&self) {
-        self.pending.store(false, Ordering::Release);
-        // ORDERING: Paired with the leading fence in `notify_after_send`. The caller rechecks the
-        // queue immediately after this clear; without a store-load barrier the driver could both
-        // overwrite a producer's `pending` and miss its queued operation.
-        fence(Ordering::SeqCst);
-    }
-
-    fn mark_pending(&self) {
-        self.pending.store(true, Ordering::Release);
-    }
-
     fn is_pending(&self) -> bool {
-        self.pending.load(Ordering::Acquire)
+        !self.inner.lock().unwrap().operations.is_empty()
     }
 
-    fn disarm(&self) {
-        drop(self.slot.take());
+    fn close(&self, closed: &AtomicBool) -> (VecDeque<Operation>, Option<Waker>) {
+        let mut inner = self.inner.lock().unwrap();
+        inner.accepting = false;
+        closed.store(true, Ordering::Release);
+        (
+            std::mem::take(&mut inner.operations),
+            inner.reactor_waker.take(),
+        )
+    }
+
+    #[cfg(test)]
+    fn disconnect(&self) {
+        self.inner.lock().unwrap().accepting = false;
     }
 }
 
-/// A single-writer observation stored as nanoseconds since the driver's genesis.
+/// A single-writer observation stored as nanoseconds since the service's genesis.
 struct AtomicObservation {
     genesis: Instant,
     nanos: AtomicU64,
@@ -282,7 +317,7 @@ impl AtomicObservation {
     }
 
     fn store(&self, observation: Instant) {
-        // ORDERING: Only the driver stores here, and readers synchronize with timer completions
+        // ORDERING: Only the service stores here, and readers synchronize with timer completions
         // through `TimerState`, never through this value.
         self.nanos
             .store(self.encode(observation), Ordering::Relaxed);
@@ -307,8 +342,7 @@ struct Shared {
     clock_mode: ClockMode,
     closed: AtomicBool,
     observed: AtomicObservation,
-    sender: mpsc::UnboundedSender<Operation>,
-    wake: DriverWake,
+    operations: OperationQueue,
 }
 
 impl Shared {
@@ -328,11 +362,13 @@ impl DelayWakeSlot {
         Self(AtomicOptionBox::none())
     }
 
-    fn register_and_load(&self, waker: &Waker, lifecycle: &AtomicU8) -> u8 {
-        self.0.store(Some(Box::new(waker.clone())));
+    fn register_and_load(&self, waker: &Waker, lifecycle: &AtomicU8) -> (u8, WakerIdentity) {
+        let registered = waker.clone();
+        let identity = WakerIdentity::new(&registered);
+        self.0.store(Some(Box::new(registered)));
         // ORDERING: Paired with `take_after_publish`; both sides may not miss the other's store.
         fence(Ordering::SeqCst);
-        lifecycle.load(Ordering::Acquire)
+        (lifecycle.load(Ordering::Acquire), identity)
     }
 
     fn take_after_publish(&self) -> Option<Waker> {
@@ -346,12 +382,34 @@ impl DelayWakeSlot {
     }
 }
 
+// The mea slot owns the live Waker. This non-owning identity avoids retaining a second clone solely
+// for the raw-identity repoll check; equal data and vtable pointers are the fast path used by
+// `Waker::will_wake`.
+#[derive(Clone, Copy, Eq, PartialEq)]
+struct WakerIdentity {
+    data: usize,
+    vtable: usize,
+}
+
+impl WakerIdentity {
+    fn new(waker: &Waker) -> Self {
+        Self {
+            data: waker.data() as usize,
+            vtable: waker.vtable() as *const _ as usize,
+        }
+    }
+
+    fn matches(self, waker: &Waker) -> bool {
+        self == Self::new(waker)
+    }
+}
+
 struct TimerState {
     // Written before publishing `STATE_FIRED` and read only after observing it.
     fired_nanos: AtomicU64,
     lifecycle: AtomicU8,
-    // Only the driver accesses this reclamation hint. Atomic interior mutability keeps the shared
-    // state `Sync`; the driver validates a non-sentinel value with `Arc::ptr_eq` before using it.
+    // Only the service accesses this reclamation hint. Atomic interior mutability keeps the shared
+    // state `Sync`; the service validates a non-sentinel value with `Arc::ptr_eq` before using it.
     slot: AtomicUsize,
     waker: DelayWakeSlot,
 }
@@ -385,7 +443,7 @@ impl TimerState {
 
 struct RegisterOp {
     deadline: Deadline,
-    // Driver processing takes this value. If the operation is dropped while it still owns the
+    // Service processing takes this value. If the operation is dropped while it still owns the
     // state, `Drop` closes the submitted delay instead of leaving it pending forever.
     state: Option<Arc<TimerState>>,
 }
@@ -414,7 +472,7 @@ enum Operation {
 
 /// A cheap-to-clone timer capability passed explicitly to tasks.
 ///
-/// See the [module level documentation](self) for the driver and reactor integration model.
+/// See the [module level documentation](self) for the service and reactor integration model.
 #[derive(Clone)]
 pub struct TimerContext {
     shared: Arc<Shared>,
@@ -429,8 +487,8 @@ impl fmt::Debug for TimerContext {
 impl TimerContext {
     /// Returns this timer capability's current clock observation.
     ///
-    /// A system-clock context returns the later of [`Instant::now`] and the driver's last
-    /// observation. A context created by [`TimerDriver::new_at`] advances only when its driver is
+    /// A system-clock context returns the later of [`Instant::now`] and the service's last
+    /// observation. A context created by [`TimerService::new_at`] advances only when its service is
     /// turned.
     pub fn now(&self) -> Instant {
         self.shared.observation()
@@ -443,7 +501,7 @@ impl TimerContext {
 
     /// Creates a lazy delay for `duration` from the context's current observation.
     ///
-    /// An unrepresentable addition creates a delay that can complete only when its driver closes.
+    /// An unrepresentable addition creates a delay that can complete only when its service closes.
     pub fn delay(&self, duration: Duration) -> Delay {
         self.delay_to(Deadline::checked_add(self.now(), duration))
     }
@@ -460,42 +518,37 @@ impl TimerContext {
     }
 
     fn send(&self, operation: Operation) -> Result<(), Operation> {
-        match self.shared.sender.send(operation) {
-            Ok(()) => {
-                self.shared.wake.notify_after_send();
-                Ok(())
-            }
-            Err(err) => Err(err.into_inner()),
-        }
+        self.shared.operations.send(operation)
     }
 }
 
-/// Reactor-owned timer source.
+/// Reactor-owned timer service.
 ///
-/// The driver starts no thread and performs no I/O. A reactor advances it with [`turn`](Self::turn)
-/// and arms its own wake primitive through [`register_wake`](Self::register_wake).
+/// The service starts no thread and performs no I/O. A reactor advances it with
+/// [`turn`](Self::turn) and arms its own wake primitive through
+/// [`register_wake`](Self::register_wake).
 ///
 /// See the [module level documentation](self) for the complete reactor contract.
-pub struct TimerDriver {
+pub struct TimerService {
     last_now: Instant,
+    operation_batch: VecDeque<Operation>,
     prefer_non_immediate: bool,
-    receiver: Option<mpsc::UnboundedReceiver<Operation>>,
     shared: Arc<Shared>,
     wheel: Wheel<Arc<TimerState>>,
 }
 
-impl fmt::Debug for TimerDriver {
+impl fmt::Debug for TimerService {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TimerDriver")
+        f.debug_struct("TimerService")
             .field("last_now", &self.last_now)
             .finish_non_exhaustive()
     }
 }
 
-impl TimerDriver {
-    /// Constructs a system-clock driver and its context.
+impl TimerService {
+    /// Constructs a system-clock service and its context.
     ///
-    /// The context observes the later of the system clock and the driver's last published
+    /// The context observes the later of the system clock and the service's last published
     /// observation, even between turns. Registered timers still complete only when the reactor
     /// calls [`turn`](Self::turn).
     pub fn new() -> (Self, TimerContext) {
@@ -503,7 +556,7 @@ impl TimerDriver {
         Self::with_clock(genesis, ClockMode::System)
     }
 
-    /// Constructs a deterministic driver whose context clock advances only through
+    /// Constructs a deterministic service whose context clock advances only through
     /// [`turn`](Self::turn).
     ///
     /// This constructor is useful for reactor tests and simulations. It does not read the system
@@ -513,34 +566,32 @@ impl TimerDriver {
     }
 
     fn with_clock(genesis: Instant, clock_mode: ClockMode) -> (Self, TimerContext) {
-        let (sender, receiver) = mpsc::unbounded();
         let shared = Arc::new(Shared {
             clock_mode,
             closed: AtomicBool::new(false),
             observed: AtomicObservation::new(genesis),
-            sender,
-            wake: DriverWake::new(),
+            operations: OperationQueue::new(),
         });
         let context = TimerContext {
             shared: shared.clone(),
         };
-        let driver = Self {
+        let service = Self {
             last_now: genesis,
+            operation_batch: VecDeque::new(),
             prefer_non_immediate: true,
-            receiver: Some(receiver),
             shared,
             wheel: Wheel::new(genesis),
         };
-        (driver, context)
+        (service, context)
     }
 
-    /// Returns when the driver should next be turned.
+    /// Returns when the service should next be turned.
     ///
-    /// Pending operations or due timer work produce the driver's current observation, requesting an
-    /// immediate turn. `None` means there is no finite timer deadline; the driver may be empty or
-    /// contain only delays created by overflowing relative-deadline arithmetic.
+    /// Pending operations or due timer work produce the service's current observation, requesting
+    /// an immediate turn. `None` means there is no finite timer deadline; the service may be
+    /// empty or contain only delays created by overflowing relative-deadline arithmetic.
     pub fn next_poll_at(&self) -> Option<Instant> {
-        if self.shared.wake.is_pending() {
+        if self.shared.operations.is_pending() {
             Some(self.last_now)
         } else {
             self.wheel.next_poll_at(self.last_now)
@@ -552,7 +603,7 @@ impl TimerDriver {
     /// Returns `false` when operations are already pending. In that case the reactor must perform
     /// a non-blocking I/O poll and call [`turn`](Self::turn) again instead of parking.
     pub fn register_wake(&self, waker: &Waker) -> bool {
-        self.shared.wake.arm(waker)
+        self.shared.operations.arm(waker)
     }
 
     /// Applies bounded operations and advances timers through `now`.
@@ -562,9 +613,9 @@ impl TimerDriver {
     /// # Panics
     ///
     /// Panics in debug builds when `now` is earlier than the previous observation. Panics in all
-    /// builds when `now` is more than `u64::MAX` nanoseconds after the driver's genesis.
+    /// builds when `now` is more than `u64::MAX` nanoseconds after the service's genesis.
     pub fn turn(&mut self, now: Instant, budget: TurnBudget) -> TurnResult {
-        debug_assert!(now >= self.last_now, "timer driver cannot move backwards");
+        debug_assert!(now >= self.last_now, "timer service cannot move backwards");
         let now = now.max(self.last_now);
         self.last_now = now;
         self.shared.observed.store(now);
@@ -614,7 +665,7 @@ impl TimerDriver {
             self.wheel.settle(now);
         }
         TurnResult {
-            has_more_work: timer_more || self.shared.wake.is_pending(),
+            has_more_work: timer_more || self.shared.operations.is_pending(),
         }
     }
 
@@ -625,26 +676,10 @@ impl TimerDriver {
     }
 
     fn drain_operations(&mut self, now: Instant, limit: usize) {
-        let mut processed = 0;
-        while processed < limit {
-            let operation = match self.receiver_mut().try_recv() {
-                Ok(operation) => operation,
-                Err(TryRecvError::Disconnected) => {
-                    self.shared.wake.mark_empty();
-                    break;
-                }
-                Err(TryRecvError::Empty) => {
-                    self.shared.wake.mark_empty();
-                    match self.receiver_mut().try_recv() {
-                        Ok(operation) => {
-                            self.shared.wake.mark_pending();
-                            operation
-                        }
-                        Err(TryRecvError::Disconnected | TryRecvError::Empty) => break,
-                    }
-                }
-            };
-            processed += 1;
+        self.shared
+            .operations
+            .drain_into(limit, &mut self.operation_batch);
+        while let Some(operation) = self.operation_batch.pop_front() {
             self.apply_operation(operation, now);
         }
     }
@@ -713,16 +748,12 @@ impl TimerDriver {
             waker.wake();
         }
     }
-
-    fn receiver_mut(&mut self) -> &mut mpsc::UnboundedReceiver<Operation> {
-        self.receiver.as_mut().expect("timer receiver must be live")
-    }
 }
 
-impl Drop for TimerDriver {
+impl Drop for TimerService {
     fn drop(&mut self) {
-        self.shared.closed.store(true, Ordering::Release);
-        self.shared.wake.disarm();
+        let (queued, reactor_waker) = self.shared.operations.close(&self.shared.closed);
+        drop(reactor_waker);
 
         let mut wakers = Vec::new();
         for state in self.wheel.drain() {
@@ -735,23 +766,22 @@ impl Drop for TimerDriver {
             waker.wake();
         }
 
-        // Dropping the receiver drops queued RegisterOps, which close timers still in
-        // STATE_SUBMITTED.
-        drop(self.receiver.take());
+        // Dropping queued RegisterOps closes timers still in STATE_SUBMITTED.
+        drop(queued);
     }
 }
 
 /// A lazy future that completes at or after its deadline.
 ///
-/// Registration happens on the first poll. Dropping the backing driver closes delays that still
-/// require driver processing, including due timers that have not yet been fired. A delay polled for
-/// the first time after its deadline completes without registering, even if the driver has already
-/// closed. Subsequent polls repeat the same terminal result.
+/// Registration happens on the first poll. Dropping the backing service closes delays that still
+/// require service processing, including due timers that have not yet been fired. A delay polled
+/// for the first time after its deadline completes without registering, even if the service has
+/// already closed. Subsequent polls repeat the same terminal result.
 ///
 /// # Cancel safety
 ///
-/// Dropping an incomplete delay marks it cancelled immediately. If the driver has already linked
-/// it into the wheel, unlinking is queued and happens during a later driver turn.
+/// Dropping an incomplete delay marks it cancelled immediately. If the service has already linked
+/// it into the wheel, unlinking is queued and happens during a later service turn.
 ///
 /// See the [module level documentation](self) for timer resolution and driving requirements.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
@@ -760,7 +790,7 @@ pub struct Delay {
     deadline: Deadline,
     closed: bool,
     fired_at: Option<Instant>,
-    registered_waker: Option<Waker>,
+    registered_waker: Option<WakerIdentity>,
     state: Option<Arc<TimerState>>,
 }
 
@@ -833,8 +863,8 @@ impl Future for Delay {
             }
 
             let state = Arc::new(TimerState::new());
-            state.waker.register_and_load(cx.waker(), &state.lifecycle);
-            this.registered_waker = Some(cx.waker().clone());
+            let (_, registered_waker) = state.waker.register_and_load(cx.waker(), &state.lifecycle);
+            this.registered_waker = Some(registered_waker);
             this.state = Some(state.clone());
             let operation = Operation::Register(RegisterOp {
                 deadline: this.deadline,
@@ -861,18 +891,18 @@ impl Future for Delay {
         let state = this.state.as_ref().expect("polled delay must have state");
         let lifecycle = if this
             .registered_waker
-            .as_ref()
-            .is_some_and(|registered| registered.will_wake(cx.waker()))
+            .is_some_and(|registered| registered.matches(cx.waker()))
         {
             // ORDERING: The shared slot still holds an equivalent waker from an earlier poll, so
             // there is nothing to publish and no fence to pair. A non-terminal lifecycle implies
-            // the slot is still armed: the driver empties it only in `take_after_publish`, which
+            // the slot is still armed: the service empties it only in `take_after_publish`, which
             // happens after the terminal transition, and `poll_lifecycle` clears it only on a
             // terminal state. Skipping the store avoids boxing a waker clone on every repoll.
             state.lifecycle.load(Ordering::Acquire)
         } else {
-            let lifecycle = state.waker.register_and_load(cx.waker(), &state.lifecycle);
-            this.registered_waker = Some(cx.waker().clone());
+            let (lifecycle, registered_waker) =
+                state.waker.register_and_load(cx.waker(), &state.lifecycle);
+            this.registered_waker = Some(registered_waker);
             lifecycle
         };
         this.poll_lifecycle(lifecycle)
@@ -929,7 +959,7 @@ impl Drop for Delay {
 pub enum TimeoutError {
     /// The timeout timer fired before the guarded future completed.
     Elapsed,
-    /// The backing timer driver closed before the timeout timer fired.
+    /// The backing timer service closed before the timeout timer fired.
     Closed,
 }
 
@@ -937,7 +967,7 @@ impl fmt::Display for TimeoutError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Elapsed => f.write_str("operation timed out"),
-            Self::Closed => f.write_str("timer driver is closed"),
+            Self::Closed => f.write_str("timer service is closed"),
         }
     }
 }
@@ -953,10 +983,10 @@ impl std::error::Error for TimeoutError {}
 /// ```
 /// use std::time::Duration;
 ///
-/// use scorpio::time::TimerDriver;
+/// use scorpio::time::TimerService;
 /// use scorpio::time::timeout;
 ///
-/// let (_driver, timer) = TimerDriver::new();
+/// let (_service, timer) = TimerService::new();
 ///
 /// // The guarded future is polled first, so one that is already ready never arms a timer.
 /// let value = pollster::block_on(timeout(&timer, Duration::from_secs(1), async { 42 }));
@@ -1079,13 +1109,13 @@ impl Interval {
 /// ```
 /// use std::time::Duration;
 ///
-/// use scorpio::time::TimerDriver;
+/// use scorpio::time::TimerService;
 /// use scorpio::time::interval;
 ///
-/// let (_driver, timer) = TimerDriver::new();
+/// let (_service, timer) = TimerService::new();
 /// let mut ticks = interval(&timer, Duration::from_secs(1));
 ///
-/// // The first tick is immediate, so it completes without a driver turn.
+/// // The first tick is immediate, so it completes without a service turn.
 /// let scheduled_at = pollster::block_on(ticks.tick());
 /// assert!(scheduled_at.is_ok());
 /// ```
@@ -1134,7 +1164,7 @@ fn skip_deadline(scheduled: Instant, period: Duration, observation: Instant) -> 
 /// Repeatedly runs `task`, waiting `delay` after each completion.
 ///
 /// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the driver
+/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
 /// closes.
 ///
 /// # Panics
@@ -1162,7 +1192,7 @@ where
 /// Repeatedly runs `task` on a fixed grid, skipping missed invocations without overlap.
 ///
 /// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the driver
+/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
 /// closes.
 ///
 /// A task that outruns its period does not cause the following invocations to run back to back.
@@ -1205,7 +1235,7 @@ where
 ///
 /// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
 /// Returning an elapsed instant repeatedly creates an intentionally busy loop.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the driver
+/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
 /// closes.
 pub async fn schedule_with_arbitrary_delay<F>(
     timer: &TimerContext,

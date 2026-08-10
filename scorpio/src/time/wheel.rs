@@ -12,7 +12,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Private hierarchical timing wheel used by the explicit timer driver.
+//! Private hierarchical timing wheel used by the explicit timer service.
 //!
 //! Finite deadlines are stored in six levels of intrusive slot lists. Deadlines outside the moving
 //! wheel horizon stay in an ordered overflow map until they can be promoted; elapsed and
@@ -87,11 +87,11 @@ struct Node<T> {
     value: T,
 }
 
-/// One unit of work charged against the driver's timer-entry budget.
+/// One unit of work charged against the service's timer-entry budget.
 pub(super) enum Step {
     /// One entry was moved between wheel tiers without becoming ready.
     Examined,
-    /// The identified entry is ready for the driver to remove and fire.
+    /// The identified entry is ready for the service to remove and fire.
     Fire(usize),
 }
 

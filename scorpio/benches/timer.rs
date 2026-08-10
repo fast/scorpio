@@ -25,7 +25,7 @@ use divan::Bencher;
 use divan::counter::ItemsCount;
 use scorpio::time::Delay;
 use scorpio::time::TimerContext;
-use scorpio::time::TimerDriver;
+use scorpio::time::TimerService;
 use scorpio::time::TurnBudget;
 
 const FAR_FUTURE: Duration = Duration::from_secs(24 * 60 * 60);
@@ -49,29 +49,53 @@ fn operation_budget(count: usize) -> TurnBudget {
     TurnBudget::new(NonZeroUsize::new(count).unwrap(), NonZeroUsize::MAX)
 }
 
-fn verify_exact_operation_batch(driver: &mut TimerDriver, now: Instant, count: usize) {
-    // Processing exactly the operation limit leaves the wake handshake pending. Fewer operations
-    // would let the driver observe an empty queue and clear it before returning.
-    assert!(driver.turn(now, operation_budget(count)).has_more_work());
-    // One extra operation would consume the probe budget and leave the handshake pending again.
-    assert!(!driver.turn(now, operation_budget(1)).has_more_work());
-    assert_eq!(driver.next_poll_at(), None);
+fn verify_exact_operation_batch(
+    service: &mut TimerService,
+    timer: &TimerContext,
+    now: Instant,
+    count: usize,
+) {
+    // Append a sentinel after the expected operations. Exactly `count` operations leave it queued;
+    // fewer process it too soon, while extras prevent the one-operation probe from reaching it.
+    let sentinel_deadline = now + FAR_FUTURE;
+    let mut sentinel = Box::pin(timer.delay_until(sentinel_deadline));
+    assert!(poll_once(sentinel.as_mut()).is_pending());
+    assert!(service.turn(now, operation_budget(count)).has_more_work());
+    assert!(!service.turn(now, operation_budget(1)).has_more_work());
+    assert!(service.next_poll_at().is_some_and(|next| next > now));
+    drop(sentinel);
+    assert!(!service.turn(now, operation_budget(1)).has_more_work());
+    assert_eq!(service.next_poll_at(), None);
 }
 
 struct FrontendLifecycleResult {
-    driver: TimerDriver,
-    _timer: TimerContext,
+    service: TimerService,
+    timer: TimerContext,
     count: usize,
+    pending_count: usize,
 }
 
 impl Drop for FrontendLifecycleResult {
     fn drop(&mut self) {
-        verify_exact_operation_batch(&mut self.driver, Instant::now(), self.count);
+        assert_eq!(self.pending_count, self.count);
+        verify_exact_operation_batch(&mut self.service, &self.timer, Instant::now(), self.count);
+    }
+}
+
+struct FrontendPollResult {
+    pending_count: usize,
+    expected_count: usize,
+}
+
+impl Drop for FrontendPollResult {
+    fn drop(&mut self) {
+        assert_eq!(self.pending_count, self.expected_count);
     }
 }
 
 struct RegisteredBatch {
-    driver: TimerDriver,
+    service: TimerService,
+    timer: TimerContext,
     delays: Vec<Pin<Box<Delay>>>,
     now: Instant,
     count: usize,
@@ -81,14 +105,14 @@ struct RegisteredBatch {
 impl Drop for RegisteredBatch {
     fn drop(&mut self) {
         assert!(!self.turn_result.has_more_work());
-        assert!(self.driver.next_poll_at().is_some());
+        assert!(self.service.next_poll_at().is_some());
         self.delays.clear();
-        verify_exact_operation_batch(&mut self.driver, self.now, self.count);
+        verify_exact_operation_batch(&mut self.service, &self.timer, self.now, self.count);
     }
 }
 
 struct ExpiredBatch {
-    driver: TimerDriver,
+    service: TimerService,
     _delays: Vec<Pin<Box<Delay>>>,
     turn_result: scorpio::time::TurnResult,
     ready_count: usize,
@@ -99,26 +123,19 @@ impl Drop for ExpiredBatch {
     fn drop(&mut self) {
         assert!(!self.turn_result.has_more_work());
         assert_eq!(self.ready_count, self.expected_count);
-        assert_eq!(self.driver.next_poll_at(), None);
+        assert_eq!(self.service.next_poll_at(), None);
     }
 }
 
 struct CancelledBatch {
-    driver: TimerDriver,
-    now: Instant,
+    service: TimerService,
     turn_result: scorpio::time::TurnResult,
 }
 
 impl Drop for CancelledBatch {
     fn drop(&mut self) {
-        assert!(self.turn_result.has_more_work());
-        assert!(
-            !self
-                .driver
-                .turn(self.now, operation_budget(1))
-                .has_more_work()
-        );
-        assert_eq!(self.driver.next_poll_at(), None);
+        assert!(!self.turn_result.has_more_work());
+        assert_eq!(self.service.next_poll_at(), None);
     }
 }
 
@@ -129,19 +146,21 @@ mod frontend_lifecycle {
     fn scorpio(bencher: Bencher, count: usize) {
         bencher
             .counter(ItemsCount::new(count))
-            .with_inputs(TimerDriver::new)
-            .bench_local_values(|(driver, timer)| {
+            .with_inputs(TimerService::new)
+            .bench_local_values(|(service, timer)| {
                 let mut delays = (0..count)
                     .map(|_| Box::pin(timer.delay(FAR_FUTURE)))
                     .collect::<Vec<_>>();
-                for delay in &mut delays {
-                    assert!(poll_once(delay.as_mut()).is_pending());
-                }
+                let pending_count = delays
+                    .iter_mut()
+                    .map(|delay| usize::from(poll_once(delay.as_mut()).is_pending()))
+                    .sum();
                 drop(delays);
                 FrontendLifecycleResult {
-                    driver,
-                    _timer: timer,
+                    service,
+                    timer,
                     count,
+                    pending_count,
                 }
             });
     }
@@ -158,10 +177,15 @@ mod frontend_lifecycle {
             let mut delays = (0..count)
                 .map(|_| Box::pin(tokio::time::sleep(FAR_FUTURE)))
                 .collect::<Vec<_>>();
-            for delay in &mut delays {
-                assert!(poll_once(delay.as_mut()).is_pending());
-            }
+            let pending_count = delays
+                .iter_mut()
+                .map(|delay| usize::from(poll_once(delay.as_mut()).is_pending()))
+                .sum();
             drop(delays);
+            FrontendPollResult {
+                pending_count,
+                expected_count: count,
+            }
         });
     }
 
@@ -171,10 +195,15 @@ mod frontend_lifecycle {
             let mut delays = (0..count)
                 .map(|_| Box::pin(async_io::Timer::after(FAR_FUTURE)))
                 .collect::<Vec<_>>();
-            for delay in &mut delays {
-                assert!(poll_once(delay.as_mut()).is_pending());
-            }
+            let pending_count = delays
+                .iter_mut()
+                .map(|delay| usize::from(poll_once(delay.as_mut()).is_pending()))
+                .sum();
             drop(delays);
+            FrontendPollResult {
+                pending_count,
+                expected_count: count,
+            }
         });
     }
 
@@ -184,36 +213,43 @@ mod frontend_lifecycle {
             let mut delays = (0..count)
                 .map(|_| Box::pin(futures_timer::Delay::new(FAR_FUTURE)))
                 .collect::<Vec<_>>();
-            for delay in &mut delays {
-                assert!(poll_once(delay.as_mut()).is_pending());
-            }
+            let pending_count = delays
+                .iter_mut()
+                .map(|delay| usize::from(poll_once(delay.as_mut()).is_pending()))
+                .sum();
             drop(delays);
+            FrontendPollResult {
+                pending_count,
+                expected_count: count,
+            }
         });
     }
 }
 
-fn submitted_scorpio_batch(count: usize) -> (TimerDriver, Vec<Pin<Box<Delay>>>, Instant) {
+fn submitted_scorpio_batch(
+    count: usize,
+) -> (TimerService, TimerContext, Vec<Pin<Box<Delay>>>, Instant) {
     let genesis = Instant::now();
     let deadline = genesis + FAR_FUTURE;
-    let (driver, timer) = TimerDriver::new_at(genesis);
+    let (service, timer) = TimerService::new_at(genesis);
     let mut delays = (0..count)
         .map(|_| Box::pin(timer.delay_until(deadline)))
         .collect::<Vec<_>>();
     for delay in &mut delays {
         assert!(poll_once(delay.as_mut()).is_pending());
     }
-    (driver, delays, genesis)
+    (service, timer, delays, genesis)
 }
 
-fn cancellation_scorpio_batch(count: usize) -> (TimerDriver, Instant) {
-    let (mut driver, delays, genesis) = submitted_scorpio_batch(count);
-    assert!(!driver.turn(genesis, full_budget()).has_more_work());
-    assert!(driver.next_poll_at().is_some());
+fn cancellation_scorpio_batch(count: usize) -> (TimerService, Instant) {
+    let (mut service, _timer, delays, genesis) = submitted_scorpio_batch(count);
+    assert!(!service.turn(genesis, full_budget()).has_more_work());
+    assert!(service.next_poll_at().is_some());
     drop(delays);
-    (driver, genesis)
+    (service, genesis)
 }
 
-mod scorpio_driver {
+mod scorpio_service {
     use super::*;
 
     #[divan::bench(args = [64, 1_024], sample_size = 1)]
@@ -221,10 +257,11 @@ mod scorpio_driver {
         bencher
             .counter(ItemsCount::new(count))
             .with_inputs(|| submitted_scorpio_batch(count))
-            .bench_local_values(|(mut driver, delays, genesis)| {
-                let turn_result = driver.turn(genesis, full_budget());
+            .bench_local_values(|(mut service, timer, delays, genesis)| {
+                let turn_result = service.turn(genesis, full_budget());
                 RegisteredBatch {
-                    driver,
+                    service,
+                    timer,
                     delays,
                     now: genesis,
                     count,
@@ -238,20 +275,19 @@ mod scorpio_driver {
         bencher
             .counter(ItemsCount::new(count))
             .with_inputs(|| cancellation_scorpio_batch(count))
-            .bench_local_values(|(mut driver, genesis)| {
-                let turn_result = driver.turn(genesis, operation_budget(count));
+            .bench_local_values(|(mut service, genesis)| {
+                let turn_result = service.turn(genesis, operation_budget(count));
                 CancelledBatch {
-                    driver,
-                    now: genesis,
+                    service,
                     turn_result,
                 }
             });
     }
 }
 
-fn scorpio_batch(count: usize, mixed: bool) -> (TimerDriver, Vec<Pin<Box<Delay>>>, Instant) {
+fn scorpio_batch(count: usize, mixed: bool) -> (TimerService, Vec<Pin<Box<Delay>>>, Instant) {
     let genesis = Instant::now();
-    let (mut driver, timer) = TimerDriver::new_at(genesis);
+    let (mut service, timer) = TimerService::new_at(genesis);
     let mut delays = (0..count)
         .map(|index| {
             let offset = if mixed {
@@ -265,14 +301,14 @@ fn scorpio_batch(count: usize, mixed: bool) -> (TimerDriver, Vec<Pin<Box<Delay>>
     for delay in &mut delays {
         assert!(poll_once(delay.as_mut()).is_pending());
     }
-    assert!(!driver.turn(genesis, full_budget()).has_more_work());
+    assert!(!service.turn(genesis, full_budget()).has_more_work());
 
     let deadline = if mixed {
         genesis + Duration::from_millis(*MIXED_OFFSETS_MILLIS.last().unwrap())
     } else {
         genesis + Duration::from_millis(1)
     };
-    (driver, delays, deadline)
+    (service, delays, deadline)
 }
 
 mod expire_registered {
@@ -283,14 +319,14 @@ mod expire_registered {
         bencher
             .counter(ItemsCount::new(count))
             .with_inputs(|| scorpio_batch(count, false))
-            .bench_local_values(|(mut driver, mut delays, deadline)| {
-                let turn_result = driver.turn(deadline, full_budget());
+            .bench_local_values(|(mut service, mut delays, deadline)| {
+                let turn_result = service.turn(deadline, full_budget());
                 let ready_count = delays
                     .iter_mut()
                     .map(|delay| usize::from(poll_once(delay.as_mut()).is_ready()))
                     .sum();
                 ExpiredBatch {
-                    driver,
+                    service,
                     _delays: delays,
                     turn_result,
                     ready_count,
@@ -304,14 +340,14 @@ mod expire_registered {
         bencher
             .counter(ItemsCount::new(count))
             .with_inputs(|| scorpio_batch(count, true))
-            .bench_local_values(|(mut driver, mut delays, deadline)| {
-                let turn_result = driver.turn(deadline, full_budget());
+            .bench_local_values(|(mut service, mut delays, deadline)| {
+                let turn_result = service.turn(deadline, full_budget());
                 let ready_count = delays
                     .iter_mut()
                     .map(|delay| usize::from(poll_once(delay.as_mut()).is_ready()))
                     .sum();
                 ExpiredBatch {
-                    driver,
+                    service,
                     _delays: delays,
                     turn_result,
                     ready_count,

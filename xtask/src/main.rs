@@ -72,7 +72,7 @@ impl CommandBench {
             "frontend_lifecycle::tokio",
             "frontend_lifecycle::async_io",
             "frontend_lifecycle::futures_timer",
-            "scorpio_driver",
+            "scorpio_service",
             "expire_registered::scorpio_",
         ];
 
