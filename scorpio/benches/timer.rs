@@ -68,8 +68,10 @@ fn verify_exact_operation_batch(
     assert_eq!(service.next_poll_at(), None);
 }
 
+// `TimerService` embeds the wheel slots. Keep it boxed so Divan's by-value input and output
+// handoff inside the timed sample moves only a pointer.
 struct FrontendLifecycleResult {
-    service: TimerService,
+    service: Box<TimerService>,
     timer: TimerContext,
     count: usize,
     pending_count: usize,
@@ -94,7 +96,7 @@ impl Drop for FrontendPollResult {
 }
 
 struct RegisteredBatch {
-    service: TimerService,
+    service: Box<TimerService>,
     timer: TimerContext,
     delays: Vec<Pin<Box<Delay>>>,
     now: Instant,
@@ -112,7 +114,7 @@ impl Drop for RegisteredBatch {
 }
 
 struct ExpiredBatch {
-    service: TimerService,
+    service: Box<TimerService>,
     _delays: Vec<Pin<Box<Delay>>>,
     turn_result: scorpio::time::TurnResult,
     ready_count: usize,
@@ -128,7 +130,7 @@ impl Drop for ExpiredBatch {
 }
 
 struct CancelledBatch {
-    service: TimerService,
+    service: Box<TimerService>,
     turn_result: scorpio::time::TurnResult,
 }
 
@@ -146,7 +148,10 @@ mod frontend_lifecycle {
     fn scorpio(bencher: Bencher, count: usize) {
         bencher
             .counter(ItemsCount::new(count))
-            .with_inputs(TimerService::new)
+            .with_inputs(|| {
+                let (service, timer) = TimerService::new();
+                (Box::new(service), timer)
+            })
             .bench_local_values(|(service, timer)| {
                 let mut delays = (0..count)
                     .map(|_| Box::pin(timer.delay(FAR_FUTURE)))
@@ -228,7 +233,12 @@ mod frontend_lifecycle {
 
 fn submitted_scorpio_batch(
     count: usize,
-) -> (TimerService, TimerContext, Vec<Pin<Box<Delay>>>, Instant) {
+) -> (
+    Box<TimerService>,
+    TimerContext,
+    Vec<Pin<Box<Delay>>>,
+    Instant,
+) {
     let genesis = Instant::now();
     let deadline = genesis + FAR_FUTURE;
     let (service, timer) = TimerService::new_at(genesis);
@@ -238,10 +248,10 @@ fn submitted_scorpio_batch(
     for delay in &mut delays {
         assert!(poll_once(delay.as_mut()).is_pending());
     }
-    (service, timer, delays, genesis)
+    (Box::new(service), timer, delays, genesis)
 }
 
-fn cancellation_scorpio_batch(count: usize) -> (TimerService, Instant) {
+fn cancellation_scorpio_batch(count: usize) -> (Box<TimerService>, Instant) {
     let (mut service, _timer, delays, genesis) = submitted_scorpio_batch(count);
     assert!(!service.turn(genesis, full_budget()).has_more_work());
     assert!(service.next_poll_at().is_some());
@@ -285,7 +295,7 @@ mod scorpio_service {
     }
 }
 
-fn scorpio_batch(count: usize, mixed: bool) -> (TimerService, Vec<Pin<Box<Delay>>>, Instant) {
+fn scorpio_batch(count: usize, mixed: bool) -> (Box<TimerService>, Vec<Pin<Box<Delay>>>, Instant) {
     let genesis = Instant::now();
     let (mut service, timer) = TimerService::new_at(genesis);
     let mut delays = (0..count)
@@ -308,7 +318,7 @@ fn scorpio_batch(count: usize, mixed: bool) -> (TimerService, Vec<Pin<Box<Delay>
     } else {
         genesis + Duration::from_millis(1)
     };
-    (service, delays, deadline)
+    (Box::new(service), delays, deadline)
 }
 
 mod expire_registered {
