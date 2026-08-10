@@ -21,22 +21,19 @@ use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
 
-use criterion::BatchSize;
-use criterion::BenchmarkId;
-use criterion::Criterion;
-use criterion::Throughput;
-use criterion::criterion_group;
-use criterion::criterion_main;
-use scorpio::IoContext;
+use divan::Bencher;
+use divan::counter::ItemsCount;
 use scorpio::time::Delay;
+use scorpio::time::TimerContext;
 use scorpio::time::TimerDriver;
 use scorpio::time::TurnBudget;
 
-const COUNTS: [usize; 3] = [1, 64, 1_024];
-const DRIVER_COUNTS: [usize; 2] = [64, 1_024];
 const FAR_FUTURE: Duration = Duration::from_secs(24 * 60 * 60);
 const MIXED_OFFSETS_MILLIS: [u64; 8] = [1, 63, 64, 65, 4_095, 4_096, 65_535, 3_600_000];
-const MAX_QUEUED_TIMERS: usize = 4_096;
+
+fn main() {
+    divan::main();
+}
 
 fn poll_once<T>(future: Pin<&mut impl Future<Output = T>>) -> Poll<T> {
     let mut cx = Context::from_waker(Waker::noop());
@@ -48,94 +45,151 @@ fn full_budget() -> TurnBudget {
     TurnBudget::new(maximum, maximum)
 }
 
-fn frontend_lifecycle(c: &mut Criterion) {
-    let mut group = c.benchmark_group("timer/frontend_lifecycle");
+fn operation_budget(count: usize) -> TurnBudget {
+    TurnBudget::new(NonZeroUsize::new(count).unwrap(), NonZeroUsize::MAX)
+}
 
-    for count in COUNTS {
-        group.throughput(Throughput::Elements(count as u64));
+fn verify_exact_operation_batch(driver: &mut TimerDriver, now: Instant, count: usize) {
+    // Processing exactly the operation limit leaves the wake handshake pending. Fewer operations
+    // would let the driver observe an empty queue and clear it before returning.
+    assert!(driver.turn(now, operation_budget(count)).has_more_work());
+    // One extra operation would consume the probe budget and leave the handshake pending again.
+    assert!(!driver.turn(now, operation_budget(1)).has_more_work());
+    assert_eq!(driver.next_poll_at(), None);
+}
 
-        group.bench_with_input(BenchmarkId::new("scorpio", count), &count, |b, &count| {
-            let (mut driver, timer) = TimerDriver::new();
-            let io = IoContext::new().with_timer(timer);
-            let timer = io.timer().unwrap();
+struct FrontendLifecycleResult {
+    driver: TimerDriver,
+    _timer: TimerContext,
+    count: usize,
+}
 
-            b.iter_custom(|iterations| {
-                let iterations_per_chunk = (MAX_QUEUED_TIMERS / count).max(1) as u64;
-                let mut measured = Duration::ZERO;
-                let mut remaining = iterations;
+impl Drop for FrontendLifecycleResult {
+    fn drop(&mut self) {
+        verify_exact_operation_batch(&mut self.driver, Instant::now(), self.count);
+    }
+}
 
-                while remaining > 0 {
-                    let chunk = remaining.min(iterations_per_chunk);
-                    let started = Instant::now();
-                    for _ in 0..chunk {
-                        let mut delays = (0..count)
-                            .map(|_| Box::pin(timer.delay(FAR_FUTURE)))
-                            .collect::<Vec<_>>();
-                        for delay in &mut delays {
-                            assert!(poll_once(delay.as_mut()).is_pending());
-                        }
-                        drop(delays);
-                    }
-                    measured += started.elapsed();
+struct RegisteredBatch {
+    driver: TimerDriver,
+    delays: Vec<Pin<Box<Delay>>>,
+    now: Instant,
+    count: usize,
+    turn_result: scorpio::time::TurnResult,
+}
 
-                    // Reclaim cancelled submissions without charging driver work to the
-                    // API-side measurement or letting the queue grow with Criterion's sample.
-                    assert!(!driver.turn(Instant::now(), full_budget()).has_more_work());
-                    remaining -= chunk;
-                }
+impl Drop for RegisteredBatch {
+    fn drop(&mut self) {
+        assert!(!self.turn_result.has_more_work());
+        assert!(self.driver.next_poll_at().is_some());
+        self.delays.clear();
+        verify_exact_operation_batch(&mut self.driver, self.now, self.count);
+    }
+}
 
-                measured
-            });
-        });
+struct ExpiredBatch {
+    driver: TimerDriver,
+    _delays: Vec<Pin<Box<Delay>>>,
+    turn_result: scorpio::time::TurnResult,
+    ready_count: usize,
+    expected_count: usize,
+}
 
-        group.bench_with_input(BenchmarkId::new("tokio", count), &count, |b, &count| {
-            let runtime = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .unwrap();
-            let _entered = runtime.enter();
+impl Drop for ExpiredBatch {
+    fn drop(&mut self) {
+        assert!(!self.turn_result.has_more_work());
+        assert_eq!(self.ready_count, self.expected_count);
+        assert_eq!(self.driver.next_poll_at(), None);
+    }
+}
 
-            b.iter(|| {
-                let mut delays = (0..count)
-                    .map(|_| Box::pin(tokio::time::sleep(FAR_FUTURE)))
-                    .collect::<Vec<_>>();
-                for delay in &mut delays {
-                    assert!(poll_once(delay.as_mut()).is_pending());
-                }
-                drop(delays);
-            });
-        });
+struct CancelledBatch {
+    driver: TimerDriver,
+    now: Instant,
+    turn_result: scorpio::time::TurnResult,
+}
 
-        group.bench_with_input(BenchmarkId::new("async_io", count), &count, |b, &count| {
-            b.iter(|| {
-                let mut delays = (0..count)
-                    .map(|_| Box::pin(async_io::Timer::after(FAR_FUTURE)))
-                    .collect::<Vec<_>>();
-                for delay in &mut delays {
-                    assert!(poll_once(delay.as_mut()).is_pending());
-                }
-                drop(delays);
-            });
-        });
-
-        group.bench_with_input(
-            BenchmarkId::new("futures_timer", count),
-            &count,
-            |b, &count| {
-                b.iter(|| {
-                    let mut delays = (0..count)
-                        .map(|_| Box::pin(futures_timer::Delay::new(FAR_FUTURE)))
-                        .collect::<Vec<_>>();
-                    for delay in &mut delays {
-                        assert!(poll_once(delay.as_mut()).is_pending());
-                    }
-                    drop(delays);
-                });
-            },
+impl Drop for CancelledBatch {
+    fn drop(&mut self) {
+        assert!(self.turn_result.has_more_work());
+        assert!(
+            !self
+                .driver
+                .turn(self.now, operation_budget(1))
+                .has_more_work()
         );
+        assert_eq!(self.driver.next_poll_at(), None);
+    }
+}
+
+mod frontend_lifecycle {
+    use super::*;
+
+    #[divan::bench(args = [1, 64, 1_024], sample_size = 1)]
+    fn scorpio(bencher: Bencher, count: usize) {
+        bencher
+            .counter(ItemsCount::new(count))
+            .with_inputs(TimerDriver::new)
+            .bench_local_values(|(driver, timer)| {
+                let mut delays = (0..count)
+                    .map(|_| Box::pin(timer.delay(FAR_FUTURE)))
+                    .collect::<Vec<_>>();
+                for delay in &mut delays {
+                    assert!(poll_once(delay.as_mut()).is_pending());
+                }
+                drop(delays);
+                FrontendLifecycleResult {
+                    driver,
+                    _timer: timer,
+                    count,
+                }
+            });
     }
 
-    group.finish();
+    #[divan::bench(args = [1, 64, 1_024], sample_size = 1)]
+    fn tokio(bencher: Bencher, count: usize) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+
+        bencher.counter(ItemsCount::new(count)).bench_local(|| {
+            let mut delays = (0..count)
+                .map(|_| Box::pin(tokio::time::sleep(FAR_FUTURE)))
+                .collect::<Vec<_>>();
+            for delay in &mut delays {
+                assert!(poll_once(delay.as_mut()).is_pending());
+            }
+            drop(delays);
+        });
+    }
+
+    #[divan::bench(args = [1, 64, 1_024], sample_size = 1)]
+    fn async_io(bencher: Bencher, count: usize) {
+        bencher.counter(ItemsCount::new(count)).bench_local(|| {
+            let mut delays = (0..count)
+                .map(|_| Box::pin(async_io::Timer::after(FAR_FUTURE)))
+                .collect::<Vec<_>>();
+            for delay in &mut delays {
+                assert!(poll_once(delay.as_mut()).is_pending());
+            }
+            drop(delays);
+        });
+    }
+
+    #[divan::bench(args = [1, 64, 1_024], sample_size = 1)]
+    fn futures_timer(bencher: Bencher, count: usize) {
+        bencher.counter(ItemsCount::new(count)).bench_local(|| {
+            let mut delays = (0..count)
+                .map(|_| Box::pin(futures_timer::Delay::new(FAR_FUTURE)))
+                .collect::<Vec<_>>();
+            for delay in &mut delays {
+                assert!(poll_once(delay.as_mut()).is_pending());
+            }
+            drop(delays);
+        });
+    }
 }
 
 fn submitted_scorpio_batch(count: usize) -> (TimerDriver, Vec<Pin<Box<Delay>>>, Instant) {
@@ -159,46 +213,40 @@ fn cancellation_scorpio_batch(count: usize) -> (TimerDriver, Instant) {
     (driver, genesis)
 }
 
-fn scorpio_driver(c: &mut Criterion) {
-    let mut group = c.benchmark_group("timer/scorpio_driver");
+mod scorpio_driver {
+    use super::*;
 
-    for count in DRIVER_COUNTS {
-        group.throughput(Throughput::Elements(count as u64));
-
-        group.bench_with_input(BenchmarkId::new("register", count), &count, |b, &count| {
-            b.iter_custom(|iterations| {
-                let mut measured = Duration::ZERO;
-                for _ in 0..iterations {
-                    let (mut driver, _delays, genesis) = submitted_scorpio_batch(count);
-                    let started = Instant::now();
-                    let result = driver.turn(genesis, full_budget());
-                    measured += started.elapsed();
-
-                    assert!(!result.has_more_work());
-                    assert!(driver.next_poll_at().is_some());
+    #[divan::bench(args = [64, 1_024], sample_size = 1)]
+    fn register(bencher: Bencher, count: usize) {
+        bencher
+            .counter(ItemsCount::new(count))
+            .with_inputs(|| submitted_scorpio_batch(count))
+            .bench_local_values(|(mut driver, delays, genesis)| {
+                let turn_result = driver.turn(genesis, full_budget());
+                RegisteredBatch {
+                    driver,
+                    delays,
+                    now: genesis,
+                    count,
+                    turn_result,
                 }
-                measured
             });
-        });
-
-        group.bench_with_input(BenchmarkId::new("cancel", count), &count, |b, &count| {
-            b.iter_custom(|iterations| {
-                let mut measured = Duration::ZERO;
-                for _ in 0..iterations {
-                    let (mut driver, genesis) = cancellation_scorpio_batch(count);
-                    let started = Instant::now();
-                    let result = driver.turn(genesis, full_budget());
-                    measured += started.elapsed();
-
-                    assert!(!result.has_more_work());
-                    assert_eq!(driver.next_poll_at(), None);
-                }
-                measured
-            });
-        });
     }
 
-    group.finish();
+    #[divan::bench(args = [64, 1_024], sample_size = 1)]
+    fn cancel(bencher: Bencher, count: usize) {
+        bencher
+            .counter(ItemsCount::new(count))
+            .with_inputs(|| cancellation_scorpio_batch(count))
+            .bench_local_values(|(mut driver, genesis)| {
+                let turn_result = driver.turn(genesis, operation_budget(count));
+                CancelledBatch {
+                    driver,
+                    now: genesis,
+                    turn_result,
+                }
+            });
+    }
 }
 
 fn scorpio_batch(count: usize, mixed: bool) -> (TimerDriver, Vec<Pin<Box<Delay>>>, Instant) {
@@ -227,95 +275,48 @@ fn scorpio_batch(count: usize, mixed: bool) -> (TimerDriver, Vec<Pin<Box<Delay>>
     (driver, delays, deadline)
 }
 
-fn expire_registered(c: &mut Criterion) {
-    let mut group = c.benchmark_group("timer/expire_registered");
+mod expire_registered {
+    use super::*;
 
-    for count in DRIVER_COUNTS {
-        group.throughput(Throughput::Elements(count as u64));
-
-        group.bench_with_input(
-            BenchmarkId::new("scorpio_driver_same_deadline", count),
-            &count,
-            |b, &count| {
-                b.iter_batched_ref(
-                    || scorpio_batch(count, false),
-                    |batch| {
-                        let (driver, delays, deadline) = batch;
-                        assert!(!driver.turn(*deadline, full_budget()).has_more_work());
-                        for delay in delays {
-                            assert!(poll_once(delay.as_mut()).is_ready());
-                        }
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
-
-        group.bench_with_input(
-            BenchmarkId::new("tokio_runtime_same_deadline", count),
-            &count,
-            |b, &count| {
-                b.iter_batched_ref(
-                    || {
-                        let runtime = tokio::runtime::Builder::new_current_thread()
-                            .enable_time()
-                            .start_paused(true)
-                            .build()
-                            .unwrap();
-                        let delays = {
-                            let _entered = runtime.enter();
-                            let deadline = tokio::time::Instant::now() + Duration::from_millis(1);
-                            let mut delays = (0..count)
-                                .map(|_| Box::pin(tokio::time::sleep_until(deadline)))
-                                .collect::<Vec<_>>();
-                            for delay in &mut delays {
-                                assert!(poll_once(delay.as_mut()).is_pending());
-                            }
-                            delays
-                        };
-                        (runtime, delays)
-                    },
-                    |batch| {
-                        let (runtime, delays) = batch;
-                        runtime.block_on(tokio::time::advance(Duration::from_millis(1)));
-                        for delay in delays {
-                            assert!(poll_once(delay.as_mut()).is_ready());
-                        }
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+    #[divan::bench(args = [64, 1_024], sample_size = 1)]
+    fn scorpio_same_deadline(bencher: Bencher, count: usize) {
+        bencher
+            .counter(ItemsCount::new(count))
+            .with_inputs(|| scorpio_batch(count, false))
+            .bench_local_values(|(mut driver, mut delays, deadline)| {
+                let turn_result = driver.turn(deadline, full_budget());
+                let ready_count = delays
+                    .iter_mut()
+                    .map(|delay| usize::from(poll_once(delay.as_mut()).is_ready()))
+                    .sum();
+                ExpiredBatch {
+                    driver,
+                    _delays: delays,
+                    turn_result,
+                    ready_count,
+                    expected_count: count,
+                }
+            });
     }
 
-    for count in DRIVER_COUNTS {
-        group.throughput(Throughput::Elements(count as u64));
-        group.bench_with_input(
-            BenchmarkId::new("scorpio_mixed_levels", count),
-            &count,
-            |b, &count| {
-                b.iter_batched_ref(
-                    || scorpio_batch(count, true),
-                    |batch| {
-                        let (driver, delays, deadline) = batch;
-                        assert!(!driver.turn(*deadline, full_budget()).has_more_work());
-                        for delay in delays {
-                            assert!(poll_once(delay.as_mut()).is_ready());
-                        }
-                    },
-                    BatchSize::PerIteration,
-                );
-            },
-        );
+    #[divan::bench(args = [64, 1_024], sample_size = 1)]
+    fn scorpio_mixed_levels(bencher: Bencher, count: usize) {
+        bencher
+            .counter(ItemsCount::new(count))
+            .with_inputs(|| scorpio_batch(count, true))
+            .bench_local_values(|(mut driver, mut delays, deadline)| {
+                let turn_result = driver.turn(deadline, full_budget());
+                let ready_count = delays
+                    .iter_mut()
+                    .map(|delay| usize::from(poll_once(delay.as_mut()).is_ready()))
+                    .sum();
+                ExpiredBatch {
+                    driver,
+                    _delays: delays,
+                    turn_result,
+                    ready_count,
+                    expected_count: count,
+                }
+            });
     }
-
-    group.finish();
 }
-
-criterion_group!(
-    benches,
-    frontend_lifecycle,
-    scorpio_driver,
-    expire_registered
-);
-criterion_main!(benches);

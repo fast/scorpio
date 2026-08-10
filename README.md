@@ -16,22 +16,23 @@
 [actions-badge]: https://github.com/fast/scorpio/actions/workflows/ci.yml/badge.svg
 [actions-url]: https://github.com/fast/scorpio/actions/workflows/ci.yml
 
-A scheduler independent asynchronous context.
+A scheduler-independent asynchronous context.
 
-Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications explicitly construct an `IoContext` from the capabilities they need, pass it through their own task boundaries, and keep the corresponding reactor drivers under their control.
+Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications construct each capability explicitly, pass its cloneable context through their own task boundaries, and keep the corresponding reactor driver under their control.
 
 ```rust
-use scorpio::IoContext;
+use std::time::Duration;
+
 use scorpio::time::TimerDriver;
 
 let (timer_driver, timer) = TimerDriver::new();
-let io = IoContext::new().with_timer(timer);
+let delay = timer.delay(Duration::from_secs(1));
 
-assert!(io.timer().is_some());
-drop(timer_driver);
+// The application reactor owns and drives `timer_driver`.
+drop((delay, timer_driver));
 ```
 
-The ownership and timing-wheel tradeoffs are documented in [Timer context design](docs/timer-design.md). Run `cargo x bench --quick` for a benchmark smoke test, or use `cargo x bench --save-baseline NAME` and `cargo x bench --baseline NAME` for a before/after performance regression comparison.
+The ownership and timing-wheel tradeoffs are documented in [Timer context design](docs/timer-design.md). Run `cargo x bench --quick` for a single-iteration benchmark smoke test, or `cargo x bench [FILTER]` for Divan's statistical measurements.
 
 ## Acknowledgements
 

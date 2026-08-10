@@ -30,17 +30,16 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-atomic-waker = { version = "1.1.2" }
-crossbeam-channel = { version = "0.5.16" }
+mea = { version = "0.6.5" }
 slab = { version = "0.4.11" }
 
 [dev-dependencies]
 async-io = { version = "2.6.0" }
-criterion = { version = "0.7.0", default-features = false }
+divan = { version = "0.1.21" }
 futures-timer = { version = "3.0.4" }
 loom = { version = "0.7.2" }
 pollster = { version = "1.0.1" }
-tokio = { version = "1.53.1", features = ["rt", "test-util", "time"] }
+tokio = { version = "1.53.1", features = ["rt", "time"] }
 
 [[bench]]
 harness = false

@@ -61,53 +61,28 @@ struct CommandBench {
         help = "Run benchmarks whose names contain this text."
     )]
     filter: Option<String>,
-    #[arg(long, help = "Stop sampling once statistical significance is reached.")]
+    #[arg(long, help = "Run each benchmark once as a smoke check.")]
     quick: bool,
-    #[arg(
-        long,
-        value_name = "NAME",
-        conflicts_with = "baseline",
-        help = "Save results as a named regression baseline."
-    )]
-    save_baseline: Option<String>,
-    #[arg(
-        long,
-        value_name = "NAME",
-        conflicts_with = "save_baseline",
-        help = "Compare results with a named regression baseline."
-    )]
-    baseline: Option<String>,
 }
 
 impl CommandBench {
     fn run(self) {
-        const ISOLATED_FILTERS: [&str; 7] = [
-            "timer/frontend_lifecycle/scorpio",
-            "timer/frontend_lifecycle/tokio",
-            "timer/frontend_lifecycle/async_io",
-            "timer/frontend_lifecycle/futures_timer",
-            "timer/scorpio_driver",
-            "timer/expire_registered/scorpio_",
-            "timer/expire_registered/tokio_runtime",
+        const ISOLATED_FILTERS: [&str; 6] = [
+            "frontend_lifecycle::scorpio",
+            "frontend_lifecycle::tokio",
+            "frontend_lifecycle::async_io",
+            "frontend_lifecycle::futures_timer",
+            "scorpio_driver",
+            "expire_registered::scorpio_",
         ];
 
         if let Some(filter) = self.filter.as_deref() {
-            run_command(make_bench_cmd(
-                Some(filter),
-                self.quick,
-                self.save_baseline.as_deref(),
-                self.baseline.as_deref(),
-            ));
+            run_command(make_bench_cmd(Some(filter), self.quick));
             return;
         }
 
         for filter in ISOLATED_FILTERS {
-            run_command(make_bench_cmd(
-                Some(filter),
-                self.quick,
-                self.save_baseline.as_deref(),
-                self.baseline.as_deref(),
-            ));
+            run_command(make_bench_cmd(Some(filter), self.quick));
         }
     }
 }
@@ -198,25 +173,14 @@ fn make_build_cmd(locked: bool) -> StdCommand {
     cmd
 }
 
-fn make_bench_cmd(
-    filter: Option<&str>,
-    quick: bool,
-    save_baseline: Option<&str>,
-    baseline: Option<&str>,
-) -> StdCommand {
+fn make_bench_cmd(filter: Option<&str>, quick: bool) -> StdCommand {
     let mut cmd = find_command("cargo");
     cmd.args(["bench", "--workspace", "--bench", "timer", "--"]);
     if let Some(filter) = filter {
         cmd.arg(filter);
     }
     if quick {
-        cmd.arg("--quick");
-    }
-    if let Some(baseline) = save_baseline {
-        cmd.args(["--save-baseline", baseline]);
-    }
-    if let Some(baseline) = baseline {
-        cmd.args(["--baseline", baseline]);
+        cmd.arg("--test");
     }
     cmd
 }

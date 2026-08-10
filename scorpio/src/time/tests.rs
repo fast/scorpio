@@ -991,8 +991,9 @@ fn fixed_rate_task_longer_than_period_stays_on_the_grid() {
     );
 }
 
-// This Loom case is a protocol litmus test, not instrumentation of the production types. Its
-// sequence mirrors `DriverWake::{notify_after_send, mark_empty}` and must stay aligned with them.
+// These Loom cases are protocol litmus tests, not instrumentation of the production types. Their
+// sequences mirror `DriverWake::{notify_after_send, mark_empty, arm}` and
+// `DelayWakeSlot::{register_and_load, take_after_publish}` and must stay aligned with them.
 #[test]
 fn model_driver_clear_and_producer_publish_cannot_both_miss() {
     loom::model(|| {
@@ -1012,7 +1013,7 @@ fn model_driver_clear_and_producer_publish_cannot_both_miss() {
         let producer_pending = pending.clone();
         let producer = thread::spawn(move || {
             producer_queued.store(true, Ordering::Release);
-            // Model the producer's send-before-pending fence against the driver's clear/recheck.
+            // Isolate the leading clear/recheck fence; the trailing fence has its own model below.
             fence(Ordering::SeqCst);
             producer_pending.swap(true, Ordering::AcqRel);
         });
@@ -1111,4 +1112,89 @@ fn a_changed_waker_is_republished() {
     drive(&mut driver, genesis + Duration::from_millis(1));
     assert_eq!(first.0.load(Ordering::Relaxed), 0);
     assert_eq!(second.0.load(Ordering::Relaxed), 1);
+}
+
+#[test]
+fn model_driver_arm_and_publish_cannot_both_miss() {
+    loom::model(|| {
+        use loom::sync::Arc;
+        use loom::sync::atomic::AtomicBool;
+        use loom::sync::atomic::Ordering;
+        use loom::sync::atomic::fence;
+        use loom::thread;
+
+        let pending = Arc::new(AtomicBool::new(false));
+        let wake_slot = Arc::new(AtomicBool::new(false));
+
+        let driver_pending = pending.clone();
+        let driver_slot = wake_slot.clone();
+        let driver = thread::spawn(move || {
+            driver_slot.swap(true, Ordering::AcqRel);
+            fence(Ordering::SeqCst);
+            let saw_pending = driver_pending.load(Ordering::Acquire);
+            if saw_pending {
+                driver_slot.swap(false, Ordering::Acquire);
+            }
+            saw_pending
+        });
+
+        let producer_pending = pending.clone();
+        let producer_slot = wake_slot.clone();
+        let producer = thread::spawn(move || {
+            // The leading clear/recheck fence is isolated in the preceding model.
+            let first = !producer_pending.swap(true, Ordering::AcqRel);
+            fence(Ordering::SeqCst);
+            if first {
+                producer_slot.swap(false, Ordering::Acquire)
+            } else {
+                false
+            }
+        });
+
+        let saw_pending = driver.join().unwrap();
+        let took_waker = producer.join().unwrap();
+        assert!(saw_pending || took_waker);
+    });
+}
+
+#[test]
+fn model_delay_registration_and_terminal_publish_cannot_both_miss() {
+    loom::model(|| {
+        use loom::sync::Arc;
+        use loom::sync::atomic::AtomicBool;
+        use loom::sync::atomic::AtomicUsize;
+        use loom::sync::atomic::Ordering;
+        use loom::sync::atomic::fence;
+        use loom::thread;
+
+        let lifecycle = Arc::new(AtomicUsize::new(STATE_REGISTERED as usize));
+        let wake_slot = Arc::new(AtomicBool::new(false));
+
+        let poll_lifecycle = lifecycle.clone();
+        let poll_slot = wake_slot.clone();
+        let polling = thread::spawn(move || {
+            poll_slot.swap(true, Ordering::AcqRel);
+            fence(Ordering::SeqCst);
+            poll_lifecycle.load(Ordering::Acquire) == STATE_FIRED as usize
+        });
+
+        let publish_lifecycle = lifecycle.clone();
+        let publish_slot = wake_slot.clone();
+        let publishing = thread::spawn(move || {
+            publish_lifecycle
+                .compare_exchange(
+                    STATE_REGISTERED as usize,
+                    STATE_FIRED as usize,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .unwrap();
+            fence(Ordering::SeqCst);
+            publish_slot.swap(false, Ordering::Acquire)
+        });
+
+        let saw_terminal = polling.join().unwrap();
+        let took_waker = publishing.join().unwrap();
+        assert!(saw_terminal || took_waker);
+    });
 }

@@ -14,24 +14,18 @@
 
 #![deny(missing_docs)]
 
-//! `scorpio` provides scheduler-independent asynchronous contexts.
-//!
-//! Applications explicitly construct an [`IoContext`] from the capabilities they need and pass it
-//! through their own task boundaries. The corresponding reactor drivers remain application-owned:
-//! Scorpio starts no default thread and never installs a process-global or thread-local handle.
+//! `scorpio` provides scheduler-independent asynchronous contexts. Each capability is constructed
+//! explicitly and passed through application-owned task boundaries. Scorpio starts no default
+//! thread and never installs a process-global or thread-local handle.
 //!
 //! # Capabilities
 //!
 //! * [`time`]: Explicitly driven delays, timeouts, intervals, and scheduled actions.
 
-mod context;
 pub mod time;
-
-pub use context::IoContext;
 
 #[cfg(test)]
 mod tests {
-    use crate::IoContext;
     use crate::time::Delay;
     use crate::time::Interval;
     use crate::time::TimerContext;
@@ -44,7 +38,6 @@ mod tests {
         do_assert_send_and_sync::<TimerDriver>();
         do_assert_send_and_sync::<Delay>();
         do_assert_send_and_sync::<Interval>();
-        do_assert_send_and_sync::<IoContext>();
     }
 
     #[test]
