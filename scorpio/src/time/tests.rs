@@ -1066,12 +1066,16 @@ fn a_changed_waker_is_republished() {
     let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
 
     assert!(poll_with_waker(delay.as_mut(), &first_waker).is_pending());
+    assert_eq!(Arc::strong_count(&first), 3);
     drive(&mut service, genesis);
     assert!(poll_with_waker(delay.as_mut(), &second_waker).is_pending());
+    assert_eq!(Arc::strong_count(&first), 2);
+    assert_eq!(Arc::strong_count(&second), 3);
 
     drive(&mut service, genesis + Duration::from_millis(1));
     assert_eq!(first.0.load(Ordering::Relaxed), 0);
     assert_eq!(second.0.load(Ordering::Relaxed), 1);
+    assert_eq!(Arc::strong_count(&second), 2);
 }
 
 // This Loom case is a protocol litmus test, not instrumentation of the production type. Its

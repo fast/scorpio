@@ -89,9 +89,11 @@ use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnMut;
 use std::pin::Pin;
+use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
@@ -102,8 +104,6 @@ use std::task::Poll;
 use std::task::Waker;
 use std::time::Duration;
 use std::time::Instant;
-
-use mea::atomicbox::AtomicOptionBox;
 
 use crate::time::wheel::Deadline;
 use crate::time::wheel::Step;
@@ -355,17 +355,19 @@ impl Shared {
     }
 }
 
-struct DelayWakeSlot(AtomicOptionBox<Waker>);
+// Specialized from `mea::atomicbox::AtomicOptionBox`: every non-null pointer is owned by the slot
+// until exactly one atomic swap transfers it back into a `Box`.
+struct DelayWakeSlot(AtomicPtr<Waker>);
 
 impl DelayWakeSlot {
     fn new() -> Self {
-        Self(AtomicOptionBox::none())
+        Self(AtomicPtr::new(ptr::null_mut()))
     }
 
     fn register_and_load(&self, waker: &Waker, lifecycle: &AtomicU8) -> (u8, WakerIdentity) {
-        let registered = waker.clone();
+        let registered = Box::new(waker.clone());
         let identity = WakerIdentity::new(&registered);
-        self.0.store(Some(Box::new(registered)));
+        drop(self.swap(Some(registered)));
         // ORDERING: Paired with `take_after_publish`; both sides may not miss the other's store.
         fence(Ordering::SeqCst);
         (lifecycle.load(Ordering::Acquire), identity)
@@ -374,15 +376,45 @@ impl DelayWakeSlot {
     fn take_after_publish(&self) -> Option<Waker> {
         // ORDERING: Paired with `register_and_load`; the lifecycle transition precedes this fence.
         fence(Ordering::SeqCst);
-        self.0.take().map(|waker| *waker)
+        self.take()
     }
 
     fn clear(&self) {
-        drop(self.0.take());
+        drop(self.swap(None));
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "the swap returns the unique pointer previously produced by Box::into_raw"
+    )]
+    fn swap(&self, replacement: Option<Box<Waker>>) -> Option<Box<Waker>> {
+        let order = if replacement.is_some() {
+            Ordering::AcqRel
+        } else {
+            Ordering::Acquire
+        };
+        let replacement = replacement.map_or(ptr::null_mut(), Box::into_raw);
+        let pointer = self.0.swap(replacement, order);
+        if pointer.is_null() {
+            None
+        } else {
+            // SAFETY: `swap` transferred the unique pointer previously owned by the slot.
+            Some(unsafe { Box::from_raw(pointer) })
+        }
+    }
+
+    fn take(&self) -> Option<Waker> {
+        self.swap(None).map(|waker| *waker)
     }
 }
 
-// The mea slot owns the live Waker. This non-owning identity avoids retaining a second clone solely
+impl Drop for DelayWakeSlot {
+    fn drop(&mut self) {
+        drop(self.take());
+    }
+}
+
+// The slot owns the live Waker. This non-owning identity avoids retaining a second clone solely
 // for the raw-identity repoll check; equal data and vtable pointers are the fast path used by
 // `Waker::will_wake`.
 #[derive(Clone, Copy, Eq, PartialEq)]
