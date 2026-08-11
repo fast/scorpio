@@ -46,4 +46,13 @@ mod tests {
         do_assert_unpin::<Delay>();
         do_assert_unpin::<Interval>();
     }
+
+    #[test]
+    fn assert_unwind_safe() {
+        fn do_assert_unwind_safe<T: std::panic::RefUnwindSafe + std::panic::UnwindSafe>() {}
+        do_assert_unwind_safe::<TimerContext>();
+        do_assert_unwind_safe::<TimerService>();
+        do_assert_unwind_safe::<Delay>();
+        do_assert_unwind_safe::<Interval>();
+    }
 }

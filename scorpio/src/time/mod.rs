@@ -82,6 +82,7 @@
 //! assert!(matches!(delay.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
 //! ```
 
+use std::cell::UnsafeCell;
 use std::collections::VecDeque;
 use std::fmt;
 use std::future::Future;
@@ -89,16 +90,13 @@ use std::future::poll_fn;
 use std::num::NonZeroUsize;
 use std::ops::AsyncFnMut;
 use std::pin::Pin;
-use std::ptr;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
-use std::sync::atomic::fence;
 use std::task::Context;
 use std::task::Poll;
 use std::task::Waker;
@@ -355,62 +353,105 @@ impl Shared {
     }
 }
 
-// Specialized from `mea::atomicbox::AtomicOptionBox`: every non-null pointer is owned by the slot
-// until exactly one atomic swap transfers it back into a `Box`.
-struct DelayWakeSlot(AtomicPtr<Waker>);
+const WAKER_READY: u8 = 0;
+const WAKER_REGISTERING: u8 = 1;
+// Terminal is absorbing. A READY predecessor transfers the waker to the publisher; a REGISTERING
+// predecessor delegates cleanup to the polling task that already owns the slot.
+const WAKER_TERMINAL: u8 = 2;
+
+struct DelayWakeSlot {
+    state: AtomicU8,
+    waker: UnsafeCell<Option<Waker>>,
+}
+
+#[allow(
+    unsafe_code,
+    reason = "the slot state transfers exclusive inline-waker access between threads"
+)]
+unsafe impl Sync for DelayWakeSlot {}
+
+// RawWaker clone and drop operations run only before acquiring or after releasing the slot state,
+// so unwinding cannot expose a partially updated inline waker through a shared reference.
+impl std::panic::RefUnwindSafe for DelayWakeSlot {}
 
 impl DelayWakeSlot {
-    fn new() -> Self {
-        Self(AtomicPtr::new(ptr::null_mut()))
-    }
-
-    fn register_and_load(&self, waker: &Waker, lifecycle: &AtomicU8) -> (u8, WakerIdentity) {
-        let registered = Box::new(waker.clone());
-        let identity = WakerIdentity::new(&registered);
-        drop(self.swap(Some(registered)));
-        // ORDERING: Paired with `take_after_publish`; both sides may not miss the other's store.
-        fence(Ordering::SeqCst);
-        (lifecycle.load(Ordering::Acquire), identity)
-    }
-
-    fn take_after_publish(&self) -> Option<Waker> {
-        // ORDERING: Paired with `register_and_load`; the lifecycle transition precedes this fence.
-        fence(Ordering::SeqCst);
-        self.take()
-    }
-
-    fn clear(&self) {
-        drop(self.swap(None));
+    fn new(waker: Waker) -> Self {
+        Self {
+            state: AtomicU8::new(WAKER_READY),
+            waker: UnsafeCell::new(Some(waker)),
+        }
     }
 
     #[allow(
         unsafe_code,
-        reason = "the swap returns the unique pointer previously produced by Box::into_raw"
+        reason = "WAKER_REGISTERING grants exclusive access to replace the inline waker"
     )]
-    fn swap(&self, replacement: Option<Box<Waker>>) -> Option<Box<Waker>> {
-        let order = if replacement.is_some() {
-            Ordering::AcqRel
-        } else {
-            Ordering::Acquire
-        };
-        let replacement = replacement.map_or(ptr::null_mut(), Box::into_raw);
-        let pointer = self.0.swap(replacement, order);
-        if pointer.is_null() {
-            None
-        } else {
-            // SAFETY: `swap` transferred the unique pointer previously owned by the slot.
-            Some(unsafe { Box::from_raw(pointer) })
+    fn register_and_load(
+        &self,
+        waker: &Waker,
+        lifecycle: &AtomicU8,
+    ) -> (u8, Option<WakerIdentity>) {
+        // Clone before claiming the slot because a custom RawWaker vtable may panic.
+        let registered = waker.clone();
+        let identity = WakerIdentity::new(&registered);
+        // ORDERING: acquire takes ownership from the preceding READY publication. A failed acquire
+        // observes a terminal publisher's state transition, which follows its lifecycle update.
+        if self
+            .state
+            .compare_exchange(
+                WAKER_READY,
+                WAKER_REGISTERING,
+                Ordering::Acquire,
+                Ordering::Acquire,
+            )
+            .is_err()
+        {
+            drop(registered);
+            return (lifecycle.load(Ordering::Acquire), None);
         }
+
+        // SAFETY: only the thread that changed READY to REGISTERING may write the slot.
+        let previous = unsafe { (&mut *self.waker.get()).replace(registered) };
+        // ORDERING: release publishes the replacement before READY. On failure, acquire observes
+        // the terminal transition and therefore the lifecycle update that preceded it.
+        if let Err(state) = self.state.compare_exchange(
+            WAKER_REGISTERING,
+            WAKER_READY,
+            Ordering::Release,
+            Ordering::Acquire,
+        ) {
+            assert_eq!(
+                state, WAKER_TERMINAL,
+                "invalid waker state after registration"
+            );
+            // SAFETY: a terminal publisher changed REGISTERING to TERMINAL and transferred cleanup
+            // to this polling thread.
+            let current = unsafe { (&mut *self.waker.get()).take() };
+            drop(current);
+        }
+        drop(previous);
+        (lifecycle.load(Ordering::Acquire), Some(identity))
     }
 
-    fn take(&self) -> Option<Waker> {
-        self.swap(None).map(|waker| *waker)
-    }
-}
-
-impl Drop for DelayWakeSlot {
-    fn drop(&mut self) {
+    fn clear(&self) {
         drop(self.take());
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "READY-to-TERMINAL grants exclusive access to take the inline waker"
+    )]
+    fn take(&self) -> Option<Waker> {
+        // ORDERING: acquire observes a replacement published before READY. Release makes a prior
+        // lifecycle transition visible to a polling task that currently owns REGISTERING.
+        match self.state.swap(WAKER_TERMINAL, Ordering::AcqRel) {
+            WAKER_READY => {
+                // SAFETY: only the thread that changed READY to TERMINAL may read the slot.
+                unsafe { (&mut *self.waker.get()).take() }
+            }
+            WAKER_REGISTERING | WAKER_TERMINAL => None,
+            state => panic!("invalid waker state before take: {state}"),
+        }
     }
 }
 
@@ -447,26 +488,25 @@ struct TimerState {
 }
 
 impl TimerState {
-    fn new() -> Self {
+    fn new(waker: Waker) -> Self {
         Self {
             fired_nanos: AtomicU64::new(0),
             lifecycle: AtomicU8::new(STATE_SUBMITTED),
             slot: AtomicUsize::new(NO_SLOT),
-            waker: DelayWakeSlot::new(),
+            waker: DelayWakeSlot::new(waker),
         }
     }
 
     fn publish_terminal(&self, from: u8, to: u8) -> Option<Waker> {
         // ORDERING: The release half publishes terminal payload such as `fired_nanos` to a polling
-        // task's acquire lifecycle load. The acquire half observes the preceding registration
-        // publication before replacing it. Waker transfer is ordered separately by
-        // `DelayWakeSlot`'s fence pair.
+        // task's acquire lifecycle load. Waker publication and transfer are ordered separately by
+        // `DelayWakeSlot`'s ownership-state transitions.
         if self
             .lifecycle
             .compare_exchange(from, to, Ordering::AcqRel, Ordering::Acquire)
             .is_ok()
         {
-            self.waker.take_after_publish()
+            self.waker.take()
         } else {
             None
         }
@@ -894,8 +934,11 @@ impl Future for Delay {
                 return Poll::Ready(Err(TimerClosed));
             }
 
-            let state = Arc::new(TimerState::new());
-            let (_, registered_waker) = state.waker.register_and_load(cx.waker(), &state.lifecycle);
+            // The state is still private, so its first waker can be initialized inline without a
+            // second allocation or synchronization.
+            let registered = cx.waker().clone();
+            let registered_waker = WakerIdentity::new(&registered);
+            let state = Arc::new(TimerState::new(registered));
             this.registered_waker = Some(registered_waker);
             this.state = Some(state.clone());
             let operation = Operation::Register(RegisterOp {
@@ -926,15 +969,19 @@ impl Future for Delay {
             .is_some_and(|registered| registered.matches(cx.waker()))
         {
             // ORDERING: The shared slot still holds an equivalent waker from an earlier poll, so
-            // there is nothing to publish and no fence to pair. A non-terminal lifecycle implies
-            // the slot is still armed: the service empties it only in `take_after_publish`, which
-            // happens after the terminal transition, and `poll_lifecycle` clears it only on a
-            // terminal state. Skipping the store avoids boxing a waker clone on every repoll.
+            // there is no registration update to synchronize. A non-terminal lifecycle implies
+            // the slot is still armed: the service empties it only after terminal publication,
+            // which happens after the terminal transition, and `poll_lifecycle` clears it only on
+            // a terminal state. Skipping the update avoids cloning and replacing the same waker on
+            // every repoll.
             state.lifecycle.load(Ordering::Acquire)
         } else {
+            this.registered_waker = None;
             let (lifecycle, registered_waker) =
                 state.waker.register_and_load(cx.waker(), &state.lifecycle);
-            this.registered_waker = Some(registered_waker);
+            if let Some(registered_waker) = registered_waker {
+                this.registered_waker = Some(registered_waker);
+            }
             lifecycle
         };
         this.poll_lifecycle(lifecycle)

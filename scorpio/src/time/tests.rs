@@ -86,6 +86,63 @@ impl Wake for WakeCount {
     }
 }
 
+#[allow(
+    unsafe_code,
+    reason = "the test needs a RawWaker whose drop callback can unwind"
+)]
+mod panic_drop_waker {
+    use std::sync::atomic::AtomicBool;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
+    use std::task::RawWaker;
+    use std::task::RawWakerVTable;
+    use std::task::Waker;
+
+    struct State {
+        panic_on_drop: AtomicBool,
+        wakes: AtomicUsize,
+    }
+
+    static STATE: State = State {
+        panic_on_drop: AtomicBool::new(false),
+        wakes: AtomicUsize::new(0),
+    };
+
+    pub(super) fn new() -> Waker {
+        STATE.panic_on_drop.store(true, Ordering::Relaxed);
+        STATE.wakes.store(0, Ordering::Relaxed);
+        let raw = RawWaker::new((&STATE as *const State).cast(), &VTABLE);
+        unsafe { Waker::from_raw(raw) }
+    }
+
+    pub(super) fn wakes() -> usize {
+        STATE.wakes.load(Ordering::Relaxed)
+    }
+
+    unsafe fn clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &VTABLE)
+    }
+
+    unsafe fn wake(data: *const ()) {
+        unsafe { &*data.cast::<State>() }
+            .wakes
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    unsafe fn wake_by_ref(data: *const ()) {
+        unsafe { wake(data) };
+    }
+
+    unsafe fn drop(data: *const ()) {
+        let state = unsafe { &*data.cast::<State>() };
+        if state.panic_on_drop.swap(false, Ordering::Relaxed) && !std::thread::panicking() {
+            panic!("intentional RawWaker drop panic");
+        }
+    }
+
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
+}
+
 #[test]
 fn default_turn_budget_matches_documented_limits() {
     let budget = TurnBudget::default();
@@ -1078,32 +1135,78 @@ fn a_changed_waker_is_republished() {
     assert_eq!(Arc::strong_count(&second), 2);
 }
 
-// This Loom case is a protocol litmus test, not instrumentation of the production type. Its
-// sequence mirrors `DelayWakeSlot::{register_and_load, take_after_publish}` and must stay aligned
-// with it.
+#[test]
+fn waker_drop_unwind_does_not_leave_a_stale_identity() {
+    let genesis = Instant::now();
+    let (mut service, timer) = TimerService::new_at(genesis);
+    let original_waker = panic_drop_waker::new();
+    let replacement = Arc::new(WakeCount::default());
+    let replacement_waker = Waker::from(replacement.clone());
+    let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
+
+    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_pending());
+    drive(&mut service, genesis);
+
+    let replacement_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let _ = poll_with_waker(delay.as_mut(), &replacement_waker);
+    }));
+    assert!(replacement_result.is_err());
+
+    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_pending());
+    drive(&mut service, genesis + Duration::from_millis(1));
+    assert_eq!(panic_drop_waker::wakes(), 1);
+    assert_eq!(replacement.0.load(Ordering::Relaxed), 0);
+    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_ready());
+}
+
+// This Loom case is a protocol litmus test, not instrumentation of the production type. Its state
+// transitions mirror `DelayWakeSlot::{register_and_load, take}`.
 #[test]
 fn model_delay_registration_and_terminal_publish_cannot_both_miss() {
     loom::model(|| {
         use loom::sync::Arc;
-        use loom::sync::atomic::AtomicBool;
         use loom::sync::atomic::AtomicUsize;
         use loom::sync::atomic::Ordering;
-        use loom::sync::atomic::fence;
         use loom::thread;
 
+        const OLD_WAKER: usize = 0;
+        const NEW_WAKER: usize = 1;
+        const EMPTY_SLOT: usize = 2;
+
         let lifecycle = Arc::new(AtomicUsize::new(STATE_REGISTERED as usize));
-        let wake_slot = Arc::new(AtomicBool::new(false));
+        let slot_state = Arc::new(AtomicUsize::new(WAKER_READY as usize));
+        let slot_value = Arc::new(AtomicUsize::new(OLD_WAKER));
 
         let poll_lifecycle = lifecycle.clone();
-        let poll_slot = wake_slot.clone();
+        let poll_state = slot_state.clone();
+        let poll_value = slot_value.clone();
         let polling = thread::spawn(move || {
-            poll_slot.swap(true, Ordering::AcqRel);
-            fence(Ordering::SeqCst);
+            if poll_state
+                .compare_exchange(
+                    WAKER_READY as usize,
+                    WAKER_REGISTERING as usize,
+                    Ordering::Acquire,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                poll_value.store(NEW_WAKER, Ordering::Relaxed);
+                if let Err(state) = poll_state.compare_exchange(
+                    WAKER_REGISTERING as usize,
+                    WAKER_READY as usize,
+                    Ordering::Release,
+                    Ordering::Acquire,
+                ) {
+                    assert_eq!(state, WAKER_TERMINAL as usize);
+                    poll_value.store(EMPTY_SLOT, Ordering::Relaxed);
+                }
+            }
             poll_lifecycle.load(Ordering::Acquire) == STATE_FIRED as usize
         });
 
         let publish_lifecycle = lifecycle.clone();
-        let publish_slot = wake_slot.clone();
+        let publish_state = slot_state.clone();
+        let publish_value = slot_value.clone();
         let publishing = thread::spawn(move || {
             publish_lifecycle
                 .compare_exchange(
@@ -1113,12 +1216,17 @@ fn model_delay_registration_and_terminal_publish_cannot_both_miss() {
                     Ordering::Acquire,
                 )
                 .unwrap();
-            fence(Ordering::SeqCst);
-            publish_slot.swap(false, Ordering::Acquire)
+            match publish_state.swap(WAKER_TERMINAL as usize, Ordering::AcqRel) {
+                state if state == WAKER_READY as usize => {
+                    publish_value.swap(EMPTY_SLOT, Ordering::Relaxed)
+                }
+                state if state == WAKER_REGISTERING as usize => EMPTY_SLOT,
+                state => panic!("invalid modeled waker state: {state}"),
+            }
         });
 
         let saw_terminal = polling.join().unwrap();
-        let took_waker = publishing.join().unwrap();
-        assert!(saw_terminal || took_waker);
+        let taken_waker = publishing.join().unwrap();
+        assert!(saw_terminal || taken_waker == NEW_WAKER);
     });
 }
