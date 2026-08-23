@@ -16,7 +16,36 @@
 [actions-badge]: https://github.com/fast/scorpio/actions/workflows/ci.yml/badge.svg
 [actions-url]: https://github.com/fast/scorpio/actions/workflows/ci.yml
 
-A scheduler independent asynchronous context.
+A scheduler-independent set of asynchronous capabilities.
+
+Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications keep each service in their own reactor and pass cloneable handles through task boundaries.
+
+```rust
+use std::time::Duration;
+
+use scorpio::time::TimerHandle;
+use scorpio::time::TimerService;
+
+#[derive(Clone)]
+struct AppContext {
+    timer: TimerHandle,
+}
+
+let timer_service = TimerService::new();
+let context = AppContext {
+    timer: timer_service.handle(),
+};
+let delay = context.timer.delay(Duration::from_secs(1));
+
+// The application reactor owns and drives `timer_service`; `delay` owns a handle clone.
+drop((delay, timer_service));
+```
+
+Run `cargo run -p scorpio --example custom_reactor` for a complete reactor that advances a timer and parks safely. The ownership and timing-wheel tradeoffs are documented in [Timer service and handle design](https://github.com/fast/scorpio/blob/main/docs/timer-design.md). Run `cargo x bench --quick` for a single-iteration benchmark smoke test, or `cargo x bench [FILTER]` for Divan's statistical measurements.
+
+## Acknowledgements
+
+The initial `time` module is adapted from [fast/mea#137](https://github.com/fast/mea/pull/137), authored by [Orthur](https://github.com/orthur2) (`Orthur <orthur2@gmail.com>`, original commit [`5476e10`](https://github.com/fast/mea/commit/5476e1006fc80729f8e646f70aba1091fde72386)).
 
 ## Minimum Rust version policy
 

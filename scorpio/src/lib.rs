@@ -14,13 +14,13 @@
 
 #![deny(missing_docs)]
 
-//! `scorpio` is a scheduler-independent asynchronous context.
+//! `scorpio` provides scheduler-independent asynchronous capabilities. Applications keep each
+//! service in their own reactor and pass cloneable handles through task boundaries. Scorpio starts
+//! no default thread and never installs a process-global or thread-local handle.
 //!
-//! # Features
+//! # Capabilities
 //!
-//! * [`time`]: Explicitly driven delays, timeouts, intervals, and scheduled actions. Its driver is
-//!   intended to be owned by an integrating asynchronous context; it starts no thread and does not
-//!   rely on a process-global or thread-local runtime handle.
+//! * [`time`]: Explicitly driven delays, timeouts, intervals, and scheduled actions.
 
 pub mod time;
 
@@ -28,14 +28,14 @@ pub mod time;
 mod tests {
     use crate::time::Delay;
     use crate::time::Interval;
-    use crate::time::TimerContext;
-    use crate::time::TimerDriver;
+    use crate::time::TimerHandle;
+    use crate::time::TimerService;
 
     #[test]
     fn assert_send_and_sync() {
         fn do_assert_send_and_sync<T: Send + Sync>() {}
-        do_assert_send_and_sync::<TimerContext>();
-        do_assert_send_and_sync::<TimerDriver>();
+        do_assert_send_and_sync::<TimerHandle>();
+        do_assert_send_and_sync::<TimerService>();
         do_assert_send_and_sync::<Delay>();
         do_assert_send_and_sync::<Interval>();
     }
@@ -45,5 +45,14 @@ mod tests {
         fn do_assert_unpin<T: Unpin>() {}
         do_assert_unpin::<Delay>();
         do_assert_unpin::<Interval>();
+    }
+
+    #[test]
+    fn assert_unwind_safe() {
+        fn do_assert_unwind_safe<T: std::panic::RefUnwindSafe + std::panic::UnwindSafe>() {}
+        do_assert_unwind_safe::<TimerHandle>();
+        do_assert_unwind_safe::<TimerService>();
+        do_assert_unwind_safe::<Delay>();
+        do_assert_unwind_safe::<Interval>();
     }
 }

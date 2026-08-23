@@ -16,7 +16,7 @@
 name = "scorpio"
 version = "0.0.1"
 
-description = "A scheduler independent asynchronous context."
+description = "Scheduler-independent asynchronous capabilities."
 
 edition.workspace = true
 homepage.workspace = true
@@ -30,12 +30,18 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-mea = { version = "0.6.5" }
 slab = { version = "0.4.11" }
 
 [dev-dependencies]
-loom = { version = "0.7.2" }
+async-io = { version = "2.6.0" }
+divan = { version = "0.1.21" }
+futures-timer = { version = "3.0.4" }
 pollster = { version = "1.0.1" }
+tokio = { version = "1.53.1", features = ["rt", "time"] }
+
+[[bench]]
+harness = false
+name = "timer"
 
 [lints]
 workspace = true
