@@ -53,11 +53,15 @@ fn tiny_budget() -> TurnBudget {
 }
 
 fn drive(service: &mut TimerService, now: Instant) {
-    let _ = service.turn(now, budget());
+    service.turn(now, budget());
 }
 
 fn drive_with_tiny_budget(service: &mut TimerService, now: Instant) {
-    let _ = service.turn(now, tiny_budget());
+    service.turn(now, tiny_budget());
+}
+
+fn wait_plan(service: &TimerService) -> WaitPlan {
+    service.prepare_wait(Waker::noop())
 }
 
 fn assert_schedule_waits_for_initial_delay(
@@ -91,6 +95,8 @@ impl Wake for WakeCount {
     reason = "the test needs a RawWaker whose drop callback can unwind"
 )]
 mod panic_drop_waker {
+    use std::sync::Mutex;
+    use std::sync::MutexGuard;
     use std::sync::atomic::AtomicBool;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -107,6 +113,11 @@ mod panic_drop_waker {
         panic_on_drop: AtomicBool::new(false),
         wakes: AtomicUsize::new(0),
     };
+    static TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    pub(super) fn serial() -> MutexGuard<'static, ()> {
+        TEST_LOCK.lock().unwrap()
+    }
 
     pub(super) fn new() -> Waker {
         STATE.panic_on_drop.store(true, Ordering::Relaxed);
@@ -188,7 +199,8 @@ fn concurrent_observation_reads_never_move_backwards() {
 
     let genesis = Instant::now();
     let final_observation = genesis + Duration::from_micros(UPDATES);
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let ready = Arc::new(Barrier::new(READERS + 1));
 
     std::thread::scope(|scope| {
@@ -224,8 +236,9 @@ fn concurrent_observation_reads_never_move_backwards() {
 }
 
 #[test]
-fn system_clock_context_uses_wall_clock_and_published_observation() {
-    let (mut service, timer) = TimerService::new();
+fn system_clock_handle_uses_wall_clock_and_published_observation() {
+    let mut service = TimerService::new();
+    let timer = service.handle();
     let duration = Duration::from_millis(10);
 
     let before = Instant::now();
@@ -246,23 +259,24 @@ fn system_clock_context_uses_wall_clock_and_published_observation() {
 }
 
 #[test]
-fn next_poll_at_reports_pending_operations_and_the_earliest_deadline() {
+fn prepare_wait_reports_pending_operations_and_the_earliest_deadline() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let later_deadline = genesis + Duration::from_millis(20);
     let earlier_deadline = genesis + Duration::from_millis(10);
 
     let mut later = Box::pin(timer.delay_until(later_deadline));
     assert!(poll(later.as_mut()).is_pending());
-    assert_eq!(service.next_poll_at(), Some(genesis));
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
     drive(&mut service, genesis);
-    assert_eq!(service.next_poll_at(), Some(later_deadline));
+    assert_eq!(wait_plan(&service), WaitPlan::Until(later_deadline));
 
     let mut earlier = Box::pin(timer.delay_until(earlier_deadline));
     assert!(poll(earlier.as_mut()).is_pending());
-    assert_eq!(service.next_poll_at(), Some(genesis));
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
     drive(&mut service, genesis);
-    assert_eq!(service.next_poll_at(), Some(earlier_deadline));
+    assert_eq!(wait_plan(&service), WaitPlan::Until(earlier_deadline));
 }
 
 #[test]
@@ -270,16 +284,17 @@ fn service_promotes_overflow_timer_and_fires_at_deadline() {
     let genesis = Instant::now();
     let promotion = genesis + Duration::from_millis(1);
     let deadline = genesis + Duration::from_millis(wheel::HORIZON);
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delay = Box::pin(timer.delay_until(deadline));
 
     assert!(poll(delay.as_mut()).is_pending());
     drive(&mut service, genesis);
-    assert_eq!(service.next_poll_at(), Some(promotion));
+    assert_eq!(wait_plan(&service), WaitPlan::Until(promotion));
 
     drive(&mut service, promotion);
     assert!(poll(delay.as_mut()).is_pending());
-    assert_eq!(service.next_poll_at(), Some(deadline));
+    assert_eq!(wait_plan(&service), WaitPlan::Until(deadline));
 
     drive(&mut service, deadline - Duration::from_millis(1));
     assert!(poll(delay.as_mut()).is_pending());
@@ -292,7 +307,8 @@ fn service_promotes_overflow_timer_and_fires_at_deadline() {
 #[should_panic(expected = "timer service cannot move backwards")]
 fn turn_rejects_a_backwards_clock_in_debug_builds() {
     let genesis = Instant::now();
-    let (mut service, _timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let _timer = service.handle();
     drive(&mut service, genesis + Duration::from_millis(1));
     drive(&mut service, genesis);
 }
@@ -300,11 +316,12 @@ fn turn_rejects_a_backwards_clock_in_debug_builds() {
 #[test]
 fn dropping_service_releases_its_registered_reactor_waker() {
     let genesis = Instant::now();
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let counter = Arc::new(WakeCount::default());
     let waker = Waker::from(counter.clone());
 
-    assert!(service.register_wake(&waker));
+    assert_eq!(service.prepare_wait(&waker), WaitPlan::Indefinite);
     drop(waker);
     assert_eq!(Arc::strong_count(&counter), 2);
 
@@ -316,7 +333,8 @@ fn dropping_service_releases_its_registered_reactor_waker() {
 #[test]
 fn completed_delay_releases_its_registered_waker() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let counter = Arc::new(WakeCount::default());
     let waker = Waker::from(counter.clone());
     let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
@@ -335,7 +353,8 @@ fn completed_delay_releases_its_registered_waker() {
 #[test]
 fn cancelled_delays_release_wakers_before_the_service_drains() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
 
     let submitted_counter = Arc::new(WakeCount::default());
     let submitted_waker = Waker::from(submitted_counter.clone());
@@ -363,14 +382,19 @@ fn cancelled_delays_release_wakers_before_the_service_drains() {
 #[test]
 fn delay_is_lazy_and_uses_driven_time() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delay = std::pin::pin!(timer.delay(Duration::from_millis(10)));
 
     assert_eq!(service.wheel.len(), 0);
     assert!(poll(delay.as_mut()).is_pending());
     assert_eq!(service.wheel.len(), 0);
 
-    assert!(!service.turn(genesis, budget()).has_more_work());
+    service.turn(genesis, budget());
+    assert_eq!(
+        wait_plan(&service),
+        WaitPlan::Until(genesis + Duration::from_millis(10))
+    );
     assert_eq!(service.wheel.len(), 1);
     assert!(poll(delay.as_mut()).is_pending());
 
@@ -383,7 +407,8 @@ fn delay_is_lazy_and_uses_driven_time() {
 #[test]
 fn dropping_service_closes_registered_delay() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delay = std::pin::pin!(timer.delay(Duration::from_secs(1)));
 
     assert!(poll(delay.as_mut()).is_pending());
@@ -397,14 +422,16 @@ fn dropping_service_closes_registered_delay() {
 #[test]
 fn service_drop_closes_due_timer_that_budget_has_not_fired() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let deadline = genesis + Duration::from_millis(1);
     let mut fired = Box::pin(timer.delay_until(deadline));
     let mut still_due = Box::pin(timer.delay_until(deadline));
 
     assert!(poll(fired.as_mut()).is_pending());
     assert!(poll(still_due.as_mut()).is_pending());
-    assert!(service.turn(deadline, tiny_budget()).has_more_work());
+    service.turn(deadline, tiny_budget());
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
     assert_eq!(poll(fired.as_mut()), Poll::Ready(Ok(())));
     assert!(poll(still_due.as_mut()).is_pending());
 
@@ -415,7 +442,8 @@ fn service_drop_closes_due_timer_that_budget_has_not_fired() {
 #[test]
 fn dropping_service_closes_queued_delay() {
     let genesis = Instant::now();
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delay = std::pin::pin!(timer.delay(Duration::from_secs(1)));
 
     assert!(poll(delay.as_mut()).is_pending());
@@ -428,7 +456,8 @@ fn dropping_service_closes_queued_delay() {
 #[test]
 fn failed_registration_send_returns_closed_without_self_wake() {
     let genesis = Instant::now();
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     service.shared.operations.disconnect();
     let counter = Arc::new(WakeCount::default());
     let waker = Waker::from(counter.clone());
@@ -446,7 +475,8 @@ fn failed_registration_send_returns_closed_without_self_wake() {
 #[test]
 fn fresh_delay_after_close_is_synchronously_closed_and_fused() {
     let genesis = Instant::now();
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     drop(service);
     let mut delay = std::pin::pin!(timer.delay_until(genesis + Duration::from_secs(1)));
 
@@ -457,7 +487,8 @@ fn fresh_delay_after_close_is_synchronously_closed_and_fused() {
 #[test]
 fn elapsed_deadline_wins_over_closed_service() {
     let genesis = Instant::now();
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     drop(service);
     let mut delay = std::pin::pin!(timer.delay_until(genesis));
 
@@ -467,7 +498,8 @@ fn elapsed_deadline_wins_over_closed_service() {
 #[test]
 fn cancellation_before_and_after_registration_reclaims_entries() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
 
     let mut submitted = Box::pin(timer.delay(Duration::from_secs(1)));
     assert!(poll(submitted.as_mut()).is_pending());
@@ -487,7 +519,8 @@ fn cancellation_before_and_after_registration_reclaims_entries() {
 #[test]
 fn operation_and_entry_budgets_bound_each_turn() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delays: Vec<_> = (0..5)
         .map(|_| Box::pin(timer.delay_until(genesis + Duration::from_millis(1))))
         .collect();
@@ -495,16 +528,22 @@ fn operation_and_entry_budgets_bound_each_turn() {
         assert!(poll(delay.as_mut()).is_pending());
     }
 
-    assert!(service.turn(genesis, tiny_budget()).has_more_work());
+    service.turn(genesis, tiny_budget());
     assert_eq!(service.wheel.len(), 2);
-    assert!(service.turn(genesis, tiny_budget()).has_more_work());
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
+    service.turn(genesis, tiny_budget());
     assert_eq!(service.wheel.len(), 4);
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
     drive_with_tiny_budget(&mut service, genesis);
     assert_eq!(service.wheel.len(), 5);
+    assert_eq!(
+        wait_plan(&service),
+        WaitPlan::Until(genesis + Duration::from_millis(1))
+    );
 
     let due = genesis + Duration::from_millis(1);
     for expected in 1..=5 {
-        let result = service.turn(due, tiny_budget());
+        service.turn(due, tiny_budget());
         let mut now_completed = 0;
         for delay in &mut delays {
             if poll(delay.as_mut()).is_ready() {
@@ -512,14 +551,22 @@ fn operation_and_entry_budgets_bound_each_turn() {
             }
         }
         assert_eq!(now_completed, expected);
-        assert_eq!(result.has_more_work(), expected != 5);
+        assert_eq!(
+            wait_plan(&service),
+            if expected == 5 {
+                WaitPlan::Indefinite
+            } else {
+                WaitPlan::Immediate
+            }
+        );
     }
 }
 
 #[test]
 fn immediate_and_wheel_timers_both_progress_under_continuous_registrations() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut existing = Box::pin(timer.delay_until(genesis + Duration::from_millis(1)));
     assert!(poll(existing.as_mut()).is_pending());
     drive(&mut service, genesis);
@@ -532,7 +579,7 @@ fn immediate_and_wheel_timers_both_progress_under_continuous_registrations() {
             assert!(poll(delay.as_mut()).is_pending());
             immediate.push(delay);
         }
-        let _ = service.turn(now, tiny_budget());
+        service.turn(now, tiny_budget());
     }
 
     assert_eq!(poll(existing.as_mut()), Poll::Ready(Ok(())));
@@ -546,7 +593,8 @@ fn immediate_and_wheel_timers_both_progress_under_continuous_registrations() {
 #[test]
 fn immediate_and_wheel_timers_share_the_entry_budget() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let due = genesis + Duration::from_millis(1);
     let mut wheel: Vec<_> = (0..8).map(|_| Box::pin(timer.delay_until(due))).collect();
     for delay in &mut wheel {
@@ -563,7 +611,8 @@ fn immediate_and_wheel_timers_share_the_entry_budget() {
         NonZeroUsize::new(16).unwrap(),
         NonZeroUsize::new(6).unwrap(),
     );
-    assert!(service.turn(due, budget).has_more_work());
+    service.turn(due, budget);
+    assert_eq!(wait_plan(&service), WaitPlan::Immediate);
     assert_eq!(
         wheel
             .iter_mut()
@@ -583,37 +632,45 @@ fn immediate_and_wheel_timers_share_the_entry_budget() {
 }
 
 #[test]
-fn operation_wake_is_coalesced_replaceable_and_renewable() {
+fn prepare_wait_wake_is_coalesced_replaceable_and_renewable() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     drive(&mut service, genesis);
     let counter = Arc::new(WakeCount::default());
     let waker = Waker::from(counter.clone());
-    assert!(service.register_wake(&waker));
+    assert_eq!(service.prepare_wait(&waker), WaitPlan::Indefinite);
 
     let mut first = Box::pin(timer.delay(Duration::from_secs(1)));
     let mut second = Box::pin(timer.delay(Duration::from_secs(2)));
     assert!(poll(first.as_mut()).is_pending());
     assert!(poll(second.as_mut()).is_pending());
     assert_eq!(counter.0.load(Ordering::Relaxed), 1);
-    assert!(!service.register_wake(&waker));
+    assert_eq!(service.prepare_wait(&waker), WaitPlan::Immediate);
 
     drive(&mut service, genesis);
     let replacement_counter = Arc::new(WakeCount::default());
     let replacement_waker = Waker::from(replacement_counter.clone());
-    assert!(service.register_wake(&waker));
-    assert!(service.register_wake(&replacement_waker));
+    assert!(matches!(service.prepare_wait(&waker), WaitPlan::Until(_)));
+    assert!(matches!(
+        service.prepare_wait(&replacement_waker),
+        WaitPlan::Until(_)
+    ));
     drop(first);
     assert_eq!(counter.0.load(Ordering::Relaxed), 1);
     assert_eq!(replacement_counter.0.load(Ordering::Relaxed), 1);
     drive(&mut service, genesis);
-    assert!(service.register_wake(&replacement_waker));
+    assert!(matches!(
+        service.prepare_wait(&replacement_waker),
+        WaitPlan::Until(_)
+    ));
 }
 
 #[test]
 fn submillisecond_deadline_never_fires_early() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let deadline = genesis + Duration::from_micros(500);
     let mut delay = Box::pin(timer.delay_until(deadline));
 
@@ -628,7 +685,8 @@ fn submillisecond_deadline_never_fires_early() {
 #[test]
 fn driven_relative_delay_keeps_submillisecond_observation() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     drive(&mut service, genesis + Duration::from_micros(500));
     let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
 
@@ -642,9 +700,10 @@ fn driven_relative_delay_keeps_submillisecond_observation() {
 #[test]
 fn timeout_prefers_guarded_future_on_tie() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
     assert_eq!(
-        pollster::block_on(timeout_at(&timer, genesis, ready(7))),
+        pollster::block_on(timer.timeout_at(genesis, ready(7))),
         Ok(7)
     );
 }
@@ -652,12 +711,10 @@ fn timeout_prefers_guarded_future_on_tie() {
 #[test]
 fn timeout_distinguishes_elapsed_and_closed() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
-    let mut elapsed = Box::pin(timeout_at(
-        &timer,
-        genesis + Duration::from_millis(1),
-        pending::<()>(),
-    ));
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let mut elapsed =
+        Box::pin(timer.timeout_at(genesis + Duration::from_millis(1), pending::<()>()));
     assert!(poll(elapsed.as_mut()).is_pending());
     drive(&mut service, genesis + Duration::from_millis(1));
     assert_eq!(
@@ -666,7 +723,7 @@ fn timeout_distinguishes_elapsed_and_closed() {
     );
     drop(elapsed);
 
-    let mut closed = Box::pin(timeout(&timer, Duration::from_secs(1), pending::<()>()));
+    let mut closed = Box::pin(timer.timeout(Duration::from_secs(1), pending::<()>()));
     assert!(poll(closed.as_mut()).is_pending());
     drop(service);
     assert_eq!(
@@ -676,15 +733,28 @@ fn timeout_distinguishes_elapsed_and_closed() {
 }
 
 #[test]
+fn high_level_futures_own_their_timer_handle() {
+    fn assert_send_static<T: Send + 'static>(_: T) {}
+
+    let service = TimerService::new();
+    let timer = service.handle();
+    assert_send_static(timer.timeout(Duration::from_secs(1), ready(())));
+    assert_send_static(timer.schedule_with_fixed_delay(None, Duration::from_secs(1), async || {}));
+    assert_send_static(timer.schedule_at_fixed_rate(None, Duration::from_secs(1), async || {}));
+    assert_send_static(timer.schedule_with_arbitrary_delay(None, async || Instant::now()));
+}
+
+#[test]
 fn never_deadline_only_completes_on_close() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut delay = Box::pin(timer.delay(Duration::MAX));
 
     assert!(poll(delay.as_mut()).is_pending());
     drive(&mut service, genesis + Duration::from_secs(10));
     assert!(poll(delay.as_mut()).is_pending());
-    assert_eq!(service.next_poll_at(), None);
+    assert_eq!(wait_plan(&service), WaitPlan::Indefinite);
     drop(service);
     assert_eq!(poll(delay.as_mut()), Poll::Ready(Err(TimerClosed)));
 }
@@ -697,9 +767,9 @@ fn interval_missed_tick_behaviors_have_distinct_schedules() {
         (MissedTickBehavior::Delay, 45),
         (MissedTickBehavior::Skip, 40),
     ] {
-        let (mut service, timer) = TimerService::new_at(genesis);
-        let mut interval = interval_at(
-            &timer,
+        let mut service = TimerService::new_at(genesis);
+        let timer = service.handle();
+        let mut interval = timer.interval_at(
             genesis + Duration::from_millis(10),
             Duration::from_millis(10),
         );
@@ -713,18 +783,24 @@ fn interval_missed_tick_behaviors_have_distinct_schedules() {
             Poll::Ready(Ok(genesis + Duration::from_millis(10)))
         );
         drop(tick);
-        assert_eq!(
-            interval.deadline,
-            Deadline::At(genesis + Duration::from_millis(expected))
-        );
+        let expected = genesis + Duration::from_millis(expected);
+        let mut next_tick = Box::pin(interval.tick());
+        if expected <= genesis + Duration::from_millis(35) {
+            assert_eq!(poll(next_tick.as_mut()), Poll::Ready(Ok(expected)));
+        } else {
+            assert!(poll(next_tick.as_mut()).is_pending());
+            drive(&mut service, expected);
+            assert_eq!(poll(next_tick.as_mut()), Poll::Ready(Ok(expected)));
+        }
     }
 }
 
 #[test]
 fn interval_has_an_immediate_first_tick() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
-    let mut interval = interval(&timer, Duration::from_millis(10));
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let mut interval = timer.interval(Duration::from_millis(10));
 
     assert_eq!(interval.missed_tick_behavior(), MissedTickBehavior::Burst);
     assert_eq!(pollster::block_on(interval.tick()), Ok(genesis));
@@ -734,24 +810,26 @@ fn interval_has_an_immediate_first_tick() {
 #[should_panic(expected = "interval period must be non-zero")]
 fn interval_rejects_a_zero_period() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
-    let _ = interval(&timer, Duration::ZERO);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let _ = timer.interval(Duration::ZERO);
 }
 
 #[test]
 #[should_panic(expected = "interval period must be non-zero")]
 fn interval_at_rejects_a_zero_period() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
-    let _ = interval_at(&timer, genesis, Duration::ZERO);
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let _ = timer.interval_at(genesis, Duration::ZERO);
 }
 
 #[test]
 fn skip_does_not_discard_a_future_grid_point_within_the_same_tick() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
-    let mut interval = interval_at(
-        &timer,
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let mut interval = timer.interval_at(
         genesis + Duration::from_millis(10),
         Duration::from_millis(10),
     );
@@ -765,18 +843,21 @@ fn skip_does_not_discard_a_future_grid_point_within_the_same_tick() {
         Poll::Ready(Ok(genesis + Duration::from_millis(10)))
     );
     drop(tick);
+    let mut next_tick = Box::pin(interval.tick());
+    assert!(poll(next_tick.as_mut()).is_pending());
+    drive(&mut service, genesis + Duration::from_millis(40));
     assert_eq!(
-        interval.deadline,
-        Deadline::At(genesis + Duration::from_millis(40))
+        poll(next_tick.as_mut()),
+        Poll::Ready(Ok(genesis + Duration::from_millis(40)))
     );
 }
 
 #[test]
 fn interval_tick_is_cancel_safe() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
-    let mut interval = interval_at(
-        &timer,
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let mut interval = timer.interval_at(
         genesis + Duration::from_millis(10),
         Duration::from_millis(10),
     );
@@ -795,11 +876,12 @@ fn interval_tick_is_cancel_safe() {
 fn scheduling_futures_do_not_spawn_and_propagate_close() {
     let genesis = Instant::now();
 
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let fixed_delay_count = Arc::new(AtomicUsize::new(0));
     let count = fixed_delay_count.clone();
-    let mut fixed_delay = Box::pin(schedule_with_fixed_delay(
-        &timer,
+    let mut fixed_delay = Box::pin(timer.schedule_with_fixed_delay(
         None,
         Duration::from_millis(1),
         async move || {
@@ -811,33 +893,31 @@ fn scheduling_futures_do_not_spawn_and_propagate_close() {
     drop(service);
     assert_eq!(poll(fixed_delay.as_mut()), Poll::Ready(Err(TimerClosed)));
 
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let fixed_rate_count = Arc::new(AtomicUsize::new(0));
     let count = fixed_rate_count.clone();
-    let mut fixed_rate = Box::pin(schedule_at_fixed_rate(
-        &timer,
-        None,
-        Duration::from_millis(1),
-        async move || {
-            count.fetch_add(1, Ordering::Relaxed);
-        },
-    ));
+    let mut fixed_rate =
+        Box::pin(
+            timer.schedule_at_fixed_rate(None, Duration::from_millis(1), async move || {
+                count.fetch_add(1, Ordering::Relaxed);
+            }),
+        );
     assert!(poll(fixed_rate.as_mut()).is_pending());
     assert_eq!(fixed_rate_count.load(Ordering::Relaxed), 1);
     drop(service);
     assert_eq!(poll(fixed_rate.as_mut()), Poll::Ready(Err(TimerClosed)));
 
-    let (service, timer) = TimerService::new_at(genesis);
+    let service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let arbitrary_count = Arc::new(AtomicUsize::new(0));
     let count = arbitrary_count.clone();
-    let mut arbitrary = Box::pin(schedule_with_arbitrary_delay(
-        &timer,
-        None,
-        async move || {
-            count.fetch_add(1, Ordering::Relaxed);
-            genesis + Duration::from_millis(1)
-        },
-    ));
+    let mut arbitrary = Box::pin(timer.schedule_with_arbitrary_delay(None, async move || {
+        count.fetch_add(1, Ordering::Relaxed);
+        genesis + Duration::from_millis(1)
+    }));
     assert!(poll(arbitrary.as_mut()).is_pending());
     assert_eq!(arbitrary_count.load(Ordering::Relaxed), 1);
     drop(service);
@@ -849,11 +929,12 @@ fn scheduling_futures_honor_their_initial_delay() {
     let genesis = Instant::now();
     let initial_delay = Some(Duration::from_millis(5));
 
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let count = Arc::new(AtomicUsize::new(0));
     let observed = count.clone();
-    let mut schedule = Box::pin(schedule_with_fixed_delay(
-        &timer,
+    let mut schedule = Box::pin(timer.schedule_with_fixed_delay(
         initial_delay,
         Duration::from_millis(1),
         async move || {
@@ -862,11 +943,12 @@ fn scheduling_futures_honor_their_initial_delay() {
     ));
     assert_schedule_waits_for_initial_delay(&mut service, genesis, schedule.as_mut(), &count);
 
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let count = Arc::new(AtomicUsize::new(0));
     let observed = count.clone();
-    let mut schedule = Box::pin(schedule_at_fixed_rate(
-        &timer,
+    let mut schedule = Box::pin(timer.schedule_at_fixed_rate(
         initial_delay,
         Duration::from_millis(1),
         async move || {
@@ -875,11 +957,12 @@ fn scheduling_futures_honor_their_initial_delay() {
     ));
     assert_schedule_waits_for_initial_delay(&mut service, genesis, schedule.as_mut(), &count);
 
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+
+    let timer = service.handle();
     let count = Arc::new(AtomicUsize::new(0));
     let observed = count.clone();
-    let mut schedule = Box::pin(schedule_with_arbitrary_delay(
-        &timer,
+    let mut schedule = Box::pin(timer.schedule_with_arbitrary_delay(
         initial_delay,
         async move || {
             observed.fetch_add(1, Ordering::Relaxed);
@@ -893,32 +976,25 @@ fn scheduling_futures_honor_their_initial_delay() {
 #[should_panic(expected = "fixed delay must be non-zero")]
 fn fixed_delay_schedule_rejects_a_zero_delay() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
-    let _ = pollster::block_on(schedule_with_fixed_delay(
-        &timer,
-        None,
-        Duration::ZERO,
-        async || {},
-    ));
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let _ = pollster::block_on(timer.schedule_with_fixed_delay(None, Duration::ZERO, async || {}));
 }
 
 #[test]
 #[should_panic(expected = "fixed rate must be non-zero")]
 fn fixed_rate_schedule_rejects_a_zero_period() {
     let genesis = Instant::now();
-    let (_service, timer) = TimerService::new_at(genesis);
-    let _ = pollster::block_on(schedule_at_fixed_rate(
-        &timer,
-        None,
-        Duration::ZERO,
-        async || {},
-    ));
+    let service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let _ = pollster::block_on(timer.schedule_at_fixed_rate(None, Duration::ZERO, async || {}));
 }
 
 #[test]
-fn concurrent_arm_and_first_operation_never_both_miss() {
+fn concurrent_prepare_wait_and_first_operation_never_both_miss() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
 
     for _ in 0..1_000 {
         drive(&mut service, genesis);
@@ -935,11 +1011,11 @@ fn concurrent_arm_and_first_operation_never_both_miss() {
         let counter = Arc::new(WakeCount::default());
         let waker = Waker::from(counter.clone());
         barrier.wait();
-        let armed = service.register_wake(&waker);
+        let plan = service.prepare_wait(&waker);
         let delay = sender.join().unwrap();
         assert!(
-            !armed || counter.0.load(Ordering::Relaxed) > 0,
-            "service armed successfully but the first producer missed its wake slot"
+            plan == WaitPlan::Immediate || counter.0.load(Ordering::Relaxed) > 0,
+            "service prepared to wait but the first producer missed its wake slot"
         );
 
         drive(&mut service, genesis);
@@ -952,7 +1028,8 @@ fn concurrent_arm_and_first_operation_never_both_miss() {
 #[test]
 fn concurrent_delay_registration_and_fire_never_lose_wake() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut now = genesis;
 
     for _ in 0..1_000 {
@@ -987,9 +1064,50 @@ fn concurrent_delay_registration_and_fire_never_lose_wake() {
 }
 
 #[test]
+fn terminal_publication_during_waker_registration_delegates_cleanup_to_poller() {
+    let old_counter = Arc::new(WakeCount::default());
+    let old_waker = Waker::from(old_counter.clone());
+    let state = Arc::new(TimerState::new(old_waker));
+    state.lifecycle.store(STATE_REGISTERED, Ordering::Relaxed);
+    let new_counter = Arc::new(WakeCount::default());
+    let new_waker = Waker::from(new_counter.clone());
+    let claimed = Arc::new(Barrier::new(2));
+    let published = Arc::new(Barrier::new(2));
+
+    let poll_state = state.clone();
+    let poll_claimed = claimed.clone();
+    let poll_published = published.clone();
+    let polling = std::thread::spawn(move || {
+        poll_state
+            .waker
+            .register_and_load_with(&new_waker, &poll_state.lifecycle, || {
+                poll_claimed.wait();
+                poll_published.wait();
+            })
+    });
+
+    claimed.wait();
+    assert_eq!(state.waker.state.load(Ordering::Acquire), WAKER_REGISTERING);
+    assert!(
+        state
+            .publish_terminal(STATE_REGISTERED, STATE_FIRED)
+            .is_none()
+    );
+    published.wait();
+
+    let (observed, identity) = polling.join().unwrap();
+    assert_eq!(observed, STATE_FIRED);
+    assert!(identity.is_some());
+    assert_eq!(state.waker.state.load(Ordering::Acquire), WAKER_TERMINAL);
+    assert_eq!(Arc::strong_count(&old_counter), 1);
+    assert_eq!(Arc::strong_count(&new_counter), 1);
+}
+
+#[test]
 fn concurrent_cancel_and_fire_reclaim_exactly_once() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let mut now = genesis;
 
     for _ in 0..1_000 {
@@ -1016,7 +1134,8 @@ fn concurrent_cancel_and_fire_reclaim_exactly_once() {
 #[test]
 fn fixed_rate_task_longer_than_period_stays_on_the_grid() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let starts = Arc::new(Mutex::new(Vec::new()));
     let observed = starts.clone();
     let clock = timer.clone();
@@ -1024,15 +1143,13 @@ fn fixed_rate_task_longer_than_period_stays_on_the_grid() {
     // Each invocation occupies 35ms of the timeline, so it misses three 10ms grid points. The
     // task has to consume that time itself: advancing the clock only between polls would let the
     // scheduler observe the pre-task instant and would not model an overrun at all.
-    let mut schedule = Box::pin(schedule_at_fixed_rate(
-        &timer,
-        None,
-        Duration::from_millis(10),
-        async move || {
-            observed.lock().unwrap().push(clock.now() - genesis);
-            let _ = clock.delay(Duration::from_millis(35)).await;
-        },
-    ));
+    let mut schedule =
+        Box::pin(
+            timer.schedule_at_fixed_rate(None, Duration::from_millis(10), async move || {
+                observed.lock().unwrap().push(clock.now() - genesis);
+                let _ = clock.delay(Duration::from_millis(35)).await;
+            }),
+        );
 
     assert!(poll(schedule.as_mut()).is_pending());
     for millis in [35, 40, 75, 80] {
@@ -1055,7 +1172,8 @@ fn fixed_rate_task_longer_than_period_stays_on_the_grid() {
 #[test]
 fn concurrent_drain_and_send_never_park_with_queued_operations() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
 
     // Exercises operation submission against wake registration on the real queue.
     for _ in 0..1_000 {
@@ -1070,13 +1188,12 @@ fn concurrent_drain_and_send_never_park_with_queued_operations() {
         });
 
         barrier.wait();
-        let result = service.turn(genesis, budget());
+        service.turn(genesis, budget());
         let delay = sender.join().unwrap();
 
         let counter = Arc::new(WakeCount::default());
         let waker = Waker::from(counter.clone());
-        let parked = !result.has_more_work() && service.register_wake(&waker);
-        if parked {
+        if service.prepare_wait(&waker) != WaitPlan::Immediate {
             assert_eq!(
                 service.wheel.len(),
                 1,
@@ -1095,7 +1212,8 @@ fn concurrent_drain_and_send_never_park_with_queued_operations() {
 #[test]
 fn repeated_polls_reuse_the_registered_waker() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let counter = Arc::new(WakeCount::default());
     let waker = Waker::from(counter.clone());
     let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
@@ -1115,7 +1233,8 @@ fn repeated_polls_reuse_the_registered_waker() {
 #[test]
 fn a_changed_waker_is_republished() {
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let first = Arc::new(WakeCount::default());
     let second = Arc::new(WakeCount::default());
     let first_waker = Waker::from(first.clone());
@@ -1137,8 +1256,10 @@ fn a_changed_waker_is_republished() {
 
 #[test]
 fn waker_drop_unwind_does_not_leave_a_stale_identity() {
+    let _serial = panic_drop_waker::serial();
     let genesis = Instant::now();
-    let (mut service, timer) = TimerService::new_at(genesis);
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
     let original_waker = panic_drop_waker::new();
     let replacement = Arc::new(WakeCount::default());
     let replacement_waker = Waker::from(replacement.clone());
@@ -1159,74 +1280,43 @@ fn waker_drop_unwind_does_not_leave_a_stale_identity() {
     assert!(poll_with_waker(delay.as_mut(), &original_waker).is_ready());
 }
 
-// This Loom case is a protocol litmus test, not instrumentation of the production type. Its state
-// transitions mirror `DelayWakeSlot::{register_and_load, take}`.
 #[test]
-fn model_delay_registration_and_terminal_publish_cannot_both_miss() {
-    loom::model(|| {
-        use loom::sync::Arc;
-        use loom::sync::atomic::AtomicUsize;
-        use loom::sync::atomic::Ordering;
-        use loom::thread;
+fn service_drop_closes_delays_before_reactor_waker_drop_unwinds() {
+    let _serial = panic_drop_waker::serial();
+    let genesis = Instant::now();
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let mut delay = Box::pin(timer.delay(Duration::from_secs(1)));
 
-        const OLD_WAKER: usize = 0;
-        const NEW_WAKER: usize = 1;
-        const EMPTY_SLOT: usize = 2;
+    assert!(poll(delay.as_mut()).is_pending());
+    drive(&mut service, genesis);
+    let reactor_waker = panic_drop_waker::new();
+    assert!(matches!(
+        service.prepare_wait(&reactor_waker),
+        WaitPlan::Until(_)
+    ));
 
-        let lifecycle = Arc::new(AtomicUsize::new(STATE_REGISTERED as usize));
-        let slot_state = Arc::new(AtomicUsize::new(WAKER_READY as usize));
-        let slot_value = Arc::new(AtomicUsize::new(OLD_WAKER));
+    let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(service)));
+    assert!(drop_result.is_err());
+    assert_eq!(poll(delay.as_mut()), Poll::Ready(Err(TimerClosed)));
+}
 
-        let poll_lifecycle = lifecycle.clone();
-        let poll_state = slot_state.clone();
-        let poll_value = slot_value.clone();
-        let polling = thread::spawn(move || {
-            if poll_state
-                .compare_exchange(
-                    WAKER_READY as usize,
-                    WAKER_REGISTERING as usize,
-                    Ordering::Acquire,
-                    Ordering::Acquire,
-                )
-                .is_ok()
-            {
-                poll_value.store(NEW_WAKER, Ordering::Relaxed);
-                if let Err(state) = poll_state.compare_exchange(
-                    WAKER_REGISTERING as usize,
-                    WAKER_READY as usize,
-                    Ordering::Release,
-                    Ordering::Acquire,
-                ) {
-                    assert_eq!(state, WAKER_TERMINAL as usize);
-                    poll_value.store(EMPTY_SLOT, Ordering::Relaxed);
-                }
-            }
-            poll_lifecycle.load(Ordering::Acquire) == STATE_FIRED as usize
-        });
+#[test]
+fn registered_cancellation_survives_task_waker_drop_unwind() {
+    let _serial = panic_drop_waker::serial();
+    let genesis = Instant::now();
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let task_waker = panic_drop_waker::new();
+    let mut delay = Box::pin(timer.delay(Duration::from_secs(1)));
 
-        let publish_lifecycle = lifecycle.clone();
-        let publish_state = slot_state.clone();
-        let publish_value = slot_value.clone();
-        let publishing = thread::spawn(move || {
-            publish_lifecycle
-                .compare_exchange(
-                    STATE_REGISTERED as usize,
-                    STATE_FIRED as usize,
-                    Ordering::AcqRel,
-                    Ordering::Acquire,
-                )
-                .unwrap();
-            match publish_state.swap(WAKER_TERMINAL as usize, Ordering::AcqRel) {
-                state if state == WAKER_READY as usize => {
-                    publish_value.swap(EMPTY_SLOT, Ordering::Relaxed)
-                }
-                state if state == WAKER_REGISTERING as usize => EMPTY_SLOT,
-                state => panic!("invalid modeled waker state: {state}"),
-            }
-        });
+    assert!(poll_with_waker(delay.as_mut(), &task_waker).is_pending());
+    drive(&mut service, genesis);
+    assert_eq!(service.wheel.len(), 1);
 
-        let saw_terminal = polling.join().unwrap();
-        let taken_waker = publishing.join().unwrap();
-        assert!(saw_terminal || taken_waker == NEW_WAKER);
-    });
+    let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(delay)));
+    assert!(drop_result.is_err());
+    drive(&mut service, genesis);
+    assert_eq!(service.wheel.len(), 0);
+    assert_eq!(wait_plan(&service), WaitPlan::Indefinite);
 }

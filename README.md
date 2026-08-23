@@ -16,23 +16,32 @@
 [actions-badge]: https://github.com/fast/scorpio/actions/workflows/ci.yml/badge.svg
 [actions-url]: https://github.com/fast/scorpio/actions/workflows/ci.yml
 
-A scheduler-independent asynchronous context.
+A scheduler-independent set of asynchronous capabilities.
 
-Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications construct each capability explicitly, pass its cloneable context through their own task boundaries, and keep the corresponding service in their own reactor.
+Scorpio does not rely on a process-global runtime, thread-local current handle, or crate-owned default thread. Applications keep each service in their own reactor and pass cloneable handles through task boundaries.
 
 ```rust
 use std::time::Duration;
 
+use scorpio::time::TimerHandle;
 use scorpio::time::TimerService;
 
-let (timer_service, timer) = TimerService::new();
-let delay = timer.delay(Duration::from_secs(1));
+#[derive(Clone)]
+struct AppContext {
+    timer: TimerHandle,
+}
 
-// The application reactor owns and drives `timer_service`.
+let timer_service = TimerService::new();
+let context = AppContext {
+    timer: timer_service.handle(),
+};
+let delay = context.timer.delay(Duration::from_secs(1));
+
+// The application reactor owns and drives `timer_service`; `delay` owns a handle clone.
 drop((delay, timer_service));
 ```
 
-The ownership and timing-wheel tradeoffs are documented in [Timer context design](docs/timer-design.md). Run `cargo x bench --quick` for a single-iteration benchmark smoke test, or `cargo x bench [FILTER]` for Divan's statistical measurements.
+Run `cargo run -p scorpio --example custom_reactor` for a complete reactor that advances a timer and parks safely. The ownership and timing-wheel tradeoffs are documented in [Timer service and handle design](https://github.com/fast/scorpio/blob/main/docs/timer-design.md). Run `cargo x bench --quick` for a single-iteration benchmark smoke test, or `cargo x bench [FILTER]` for Divan's statistical measurements.
 
 ## Acknowledgements
 

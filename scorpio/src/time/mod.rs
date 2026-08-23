@@ -12,32 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Explicitly driven timer primitives for Scorpio's asynchronous context.
+//! Explicitly driven timer primitives for application-owned reactors.
 //!
 //! [`TimerService`] owns time advancement. It starts no thread and opens no I/O resource; an event
-//! loop calls [`TimerService::turn`] and uses [`TimerService::next_poll_at`] to choose its next
-//! poll deadline. Tasks receive a cloneable [`TimerContext`] and create lazy [`Delay`] futures from
-//! it.
+//! loop calls [`TimerService::turn`] and [`TimerService::prepare_wait`]. Tasks receive a cloneable
+//! [`TimerHandle`] and create lazy [`Delay`] futures from it.
 //!
 //! # Reactor contract
 //!
-//! After each timer turn, the integrating event loop must:
-//!
-//! 1. use a zero timeout when [`TurnResult::has_more_work`] is true;
-//! 2. otherwise call [`TimerService::register_wake`] before parking and use a zero timeout if it
-//!    returns `false`;
-//! 3. only after a successful registration, read [`TimerService::next_poll_at`] and calculate the
-//!    timeout against a fresh clock observation.
-//!
-//! Even when timer work remains, the reactor should perform one non-blocking I/O poll and dispatch
-//! ready I/O before calling `turn` again. This preserves progress for both sources.
+//! After each timer turn, the integrating event loop calls [`TimerService::prepare_wait`] once and
+//! applies the returned [`WaitPlan`] to its I/O poll. [`WaitPlan::Immediate`] means the poll must
+//! not block. After dispatching ready I/O, the loop calls `turn` again. `prepare_wait` registers
+//! the reactor waker and chooses the timer deadline as one operation, so callers cannot introduce a
+//! lost-wakeup window by performing those steps in the wrong order.
 //!
 //! # Operation backlog and cancellation
 //!
 //! Registrations and cancellations use an unbounded operation queue. One turn processes at most
 //! [`TurnBudget::max_operations`] messages. When producers outpace the service, operations remain
-//! queued instead of being rejected for capacity, so the reactor must keep taking non-blocking
-//! turns while [`TurnResult::has_more_work`] is true.
+//! queued instead of being rejected for capacity, so [`TimerService::prepare_wait`] returns
+//! [`WaitPlan::Immediate`] while a backlog remains.
 //!
 //! Dropping a submitted delay prevents its registration from becoming active in the wheel.
 //! Dropping an already registered delay marks it cancelled immediately, but queues its removal
@@ -63,22 +57,25 @@
 //!
 //! use scorpio::time::TimerService;
 //! use scorpio::time::TurnBudget;
+//! use scorpio::time::WaitPlan;
 //!
 //! let start = Instant::now();
 //! let deadline = start + Duration::from_millis(10);
-//! let (mut service, timer) = TimerService::new_at(start);
+//! let mut service = TimerService::new_at(start);
+//! let timer = service.handle();
 //! let mut delay = pin!(timer.delay_until(deadline));
 //! let mut cx = Context::from_waker(Waker::noop());
 //!
 //! assert!(delay.as_mut().poll(&mut cx).is_pending());
-//! // The first poll queued a registration, so a reactor may not park yet.
-//! assert!(!service.register_wake(Waker::noop()));
-//! assert!(!service.turn(start, TurnBudget::default()).has_more_work());
+//! // The first poll queued a registration. One turn moves it into the timing wheel.
+//! service.turn(start, TurnBudget::default());
 //!
-//! // With the queue drained, the reactor can arm its wake and use the timer deadline.
-//! assert!(service.register_wake(Waker::noop()));
-//! assert_eq!(service.next_poll_at(), Some(deadline));
-//! let _ = service.turn(start + Duration::from_millis(10), TurnBudget::default());
+//! // Preparing to wait atomically arms the reactor and returns the timer deadline.
+//! assert_eq!(
+//!     service.prepare_wait(Waker::noop()),
+//!     WaitPlan::Until(deadline)
+//! );
+//! service.turn(start + Duration::from_millis(10), TurnBudget::default());
 //! assert!(matches!(delay.as_mut().poll(&mut cx), Poll::Ready(Ok(()))));
 //! ```
 
@@ -162,24 +159,19 @@ impl Default for TurnBudget {
     }
 }
 
-/// The result of one [`TimerService::turn`].
+/// How the reactor should wait before its next timer turn.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-#[must_use = "the reactor must inspect whether timer work remains"]
-pub struct TurnResult {
-    has_more_work: bool,
+#[must_use = "the reactor must apply the returned wait plan"]
+pub enum WaitPlan {
+    /// Poll I/O without blocking, then turn the timer service again.
+    Immediate,
+    /// Wait until this deadline unless I/O or the registered waker interrupts the reactor first.
+    Until(Instant),
+    /// Wait indefinitely unless I/O or the registered waker interrupts the reactor.
+    Indefinite,
 }
 
-impl TurnResult {
-    /// Returns whether immediately runnable timer work remains.
-    ///
-    /// An integrating reactor must not block when this is `true`, but should still give I/O one
-    /// non-blocking poll between timer turns.
-    pub const fn has_more_work(self) -> bool {
-        self.has_more_work
-    }
-}
-
-/// Error returned when the service backing a timer context has been dropped.
+/// Error returned when the service backing a timer handle has been dropped.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct TimerClosed;
 
@@ -271,10 +263,6 @@ impl OperationQueue {
         } else {
             target.extend(inner.operations.drain(..count));
         }
-    }
-
-    fn is_pending(&self) -> bool {
-        !self.inner.lock().unwrap().operations.is_empty()
     }
 
     fn close(&self, closed: &AtomicBool) -> (VecDeque<Operation>, Option<Waker>) {
@@ -382,15 +370,27 @@ impl DelayWakeSlot {
         }
     }
 
-    #[allow(
-        unsafe_code,
-        reason = "WAKER_REGISTERING grants exclusive access to replace the inline waker"
-    )]
     fn register_and_load(
         &self,
         waker: &Waker,
         lifecycle: &AtomicU8,
     ) -> (u8, Option<WakerIdentity>) {
+        self.register_and_load_with(waker, lifecycle, || {})
+    }
+
+    #[allow(
+        unsafe_code,
+        reason = "WAKER_REGISTERING grants exclusive access to replace the inline waker"
+    )]
+    fn register_and_load_with<F>(
+        &self,
+        waker: &Waker,
+        lifecycle: &AtomicU8,
+        after_claim: F,
+    ) -> (u8, Option<WakerIdentity>)
+    where
+        F: FnOnce(),
+    {
         // Clone before claiming the slot because a custom RawWaker vtable may panic.
         let registered = waker.clone();
         let identity = WakerIdentity::new(&registered);
@@ -409,6 +409,10 @@ impl DelayWakeSlot {
             drop(registered);
             return (lifecycle.load(Ordering::Acquire), None);
         }
+
+        // Tests pause here to force terminal publication through the REGISTERING branch. The
+        // production caller passes an empty closure, which optimizes away.
+        after_claim();
 
         // SAFETY: only the thread that changed READY to REGISTERING may write the slot.
         let previous = unsafe { (&mut *self.waker.get()).replace(registered) };
@@ -542,25 +546,25 @@ enum Operation {
     Cancel(Arc<TimerState>),
 }
 
-/// A cheap-to-clone timer capability passed explicitly to tasks.
+/// A cheap-to-clone handle for creating timers from tasks.
 ///
 /// See the [module level documentation](self) for the service and reactor integration model.
 #[derive(Clone)]
-pub struct TimerContext {
+pub struct TimerHandle {
     shared: Arc<Shared>,
 }
 
-impl fmt::Debug for TimerContext {
+impl fmt::Debug for TimerHandle {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("TimerContext").finish_non_exhaustive()
+        f.debug_struct("TimerHandle").finish_non_exhaustive()
     }
 }
 
-impl TimerContext {
+impl TimerHandle {
     /// Returns this timer capability's current clock observation.
     ///
-    /// A system-clock context returns the later of [`Instant::now`] and the service's last
-    /// observation. A context created by [`TimerService::new_at`] advances only when its service is
+    /// A system-clock handle returns the later of [`Instant::now`] and the service's last
+    /// observation. A handle created by [`TimerService::new_at`] advances only when its service is
     /// turned.
     pub fn now(&self) -> Instant {
         self.shared.observation()
@@ -571,16 +575,120 @@ impl TimerContext {
         self.delay_to(Deadline::At(deadline))
     }
 
-    /// Creates a lazy delay for `duration` from the context's current observation.
+    /// Creates a lazy delay for `duration` from the handle's current observation.
     ///
     /// An unrepresentable addition creates a delay that can complete only when its service closes.
     pub fn delay(&self, duration: Duration) -> Delay {
         self.delay_to(Deadline::checked_add(self.now(), duration))
     }
 
+    /// Runs `future` until it completes or `duration` elapses.
+    ///
+    /// The guarded future wins when both branches become ready in the same poll. The returned
+    /// future owns a timer handle and can therefore cross a `'static` task boundary when `future`
+    /// can.
+    pub fn timeout<F>(
+        &self,
+        duration: Duration,
+        future: F,
+    ) -> impl Future<Output = Result<F::Output, TimeoutError>> + use<F>
+    where
+        F: Future,
+    {
+        timeout_with_delay(self.delay(duration), future)
+    }
+
+    /// Runs `future` until it completes or `deadline` is reached.
+    ///
+    /// The guarded future wins when both branches become ready in the same poll.
+    pub fn timeout_at<F>(
+        &self,
+        deadline: Instant,
+        future: F,
+    ) -> impl Future<Output = Result<F::Output, TimeoutError>> + use<F>
+    where
+        F: Future,
+    {
+        timeout_with_delay(self.delay_until(deadline), future)
+    }
+
+    /// Creates an interval with an immediate first tick.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `period` is zero.
+    pub fn interval(&self, period: Duration) -> Interval {
+        interval_from_deadline(self, Deadline::At(self.now()), period)
+    }
+
+    /// Creates an interval whose first tick is scheduled at `start`.
+    ///
+    /// # Panics
+    ///
+    /// Panics when `period` is zero.
+    pub fn interval_at(&self, start: Instant, period: Duration) -> Interval {
+        interval_from_deadline(self, Deadline::At(start), period)
+    }
+
+    /// Repeatedly runs `task`, waiting `delay` after each completion.
+    ///
+    /// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
+    /// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the
+    /// service closes.
+    ///
+    /// # Panics
+    ///
+    /// Panics when first polled if `delay` is zero.
+    pub fn schedule_with_fixed_delay<F>(
+        &self,
+        initial_delay: Option<Duration>,
+        delay: Duration,
+        task: F,
+    ) -> impl Future<Output = Result<(), TimerClosed>> + use<F>
+    where
+        F: AsyncFnMut(),
+    {
+        schedule_with_fixed_delay(self.clone(), initial_delay, delay, task)
+    }
+
+    /// Repeatedly runs `task` on a fixed grid, skipping missed invocations without overlap.
+    ///
+    /// `None` starts the first task immediately; `Some(duration)` delays the first invocation. A
+    /// task that outruns its period does not cause following invocations to run back to back.
+    ///
+    /// # Panics
+    ///
+    /// Panics when first polled if `period` is zero.
+    pub fn schedule_at_fixed_rate<F>(
+        &self,
+        initial_delay: Option<Duration>,
+        period: Duration,
+        task: F,
+    ) -> impl Future<Output = Result<(), TimerClosed>> + use<F>
+    where
+        F: AsyncFnMut(),
+    {
+        schedule_at_fixed_rate(self.clone(), initial_delay, period, task)
+    }
+
+    /// Repeatedly runs `task`, using each returned instant as the next deadline.
+    ///
+    /// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
+    /// Returning an elapsed instant repeatedly creates an intentionally busy loop.
+    pub fn schedule_with_arbitrary_delay<F>(
+        &self,
+        initial_delay: Option<Duration>,
+        task: F,
+    ) -> impl Future<Output = Result<(), TimerClosed>> + use<F>
+    where
+        F: AsyncFnMut() -> Instant,
+    {
+        schedule_with_arbitrary_delay(self.clone(), initial_delay, task)
+    }
+
     fn delay_to(&self, deadline: Deadline) -> Delay {
         Delay {
-            context: self.clone(),
+            handle: self.clone(),
             deadline,
             closed: false,
             fired_at: None,
@@ -597,8 +705,8 @@ impl TimerContext {
 /// Reactor-owned timer service.
 ///
 /// The service starts no thread and performs no I/O. A reactor advances it with
-/// [`turn`](Self::turn) and arms its own wake primitive through
-/// [`register_wake`](Self::register_wake).
+/// [`turn`](Self::turn), then obtains an atomic parking decision through
+/// [`prepare_wait`](Self::prepare_wait).
 ///
 /// See the [module level documentation](self) for the complete reactor contract.
 pub struct TimerService {
@@ -618,64 +726,68 @@ impl fmt::Debug for TimerService {
 }
 
 impl TimerService {
-    /// Constructs a system-clock service and its context.
+    /// Constructs a system-clock service.
     ///
-    /// The context observes the later of the system clock and the service's last published
-    /// observation, even between turns. Registered timers still complete only when the reactor
-    /// calls [`turn`](Self::turn).
-    pub fn new() -> (Self, TimerContext) {
+    /// Handles obtained from [`handle`](Self::handle) observe the later of the system clock and the
+    /// service's last published observation, even between turns. Registered timers still complete
+    /// only when the reactor calls [`turn`](Self::turn).
+    pub fn new() -> Self {
         let genesis = Instant::now();
         Self::with_clock(genesis, ClockMode::System)
     }
 
-    /// Constructs a deterministic service whose context clock advances only through
+    /// Constructs a deterministic service whose handle clock advances only through
     /// [`turn`](Self::turn).
     ///
     /// This constructor is useful for reactor tests and simulations. It does not read the system
     /// clock after construction.
-    pub fn new_at(genesis: Instant) -> (Self, TimerContext) {
+    pub fn new_at(genesis: Instant) -> Self {
         Self::with_clock(genesis, ClockMode::Driven)
     }
 
-    fn with_clock(genesis: Instant, clock_mode: ClockMode) -> (Self, TimerContext) {
+    fn with_clock(genesis: Instant, clock_mode: ClockMode) -> Self {
         let shared = Arc::new(Shared {
             clock_mode,
             closed: AtomicBool::new(false),
             observed: AtomicObservation::new(genesis),
             operations: OperationQueue::new(),
         });
-        let context = TimerContext {
-            shared: shared.clone(),
-        };
-        let service = Self {
+        Self {
             last_now: genesis,
             operation_batch: VecDeque::new(),
             prefer_non_immediate: true,
             shared,
             wheel: Wheel::new(genesis),
-        };
-        (service, context)
-    }
-
-    /// Returns when the service should next be turned.
-    ///
-    /// Pending operations or due timer work produce the service's current observation, requesting
-    /// an immediate turn. `None` means there is no finite timer deadline; the service may be
-    /// empty or contain only delays created by overflowing relative-deadline arithmetic.
-    pub fn next_poll_at(&self) -> Option<Instant> {
-        if self.shared.operations.is_pending() {
-            Some(self.last_now)
-        } else {
-            self.wheel.next_poll_at(self.last_now)
         }
     }
 
-    /// Registers a replaceable one-shot wake notification before the reactor parks.
+    /// Returns a cloneable task-side timer handle.
+    pub fn handle(&self) -> TimerHandle {
+        TimerHandle {
+            shared: self.shared.clone(),
+        }
+    }
+
+    /// Atomically prepares the reactor to wait after a timer turn.
     ///
-    /// Returns `false` when operations are already pending. In that case the reactor must perform
-    /// a non-blocking I/O poll and call [`turn`](Self::turn) again instead of parking.
-    pub fn register_wake(&self, waker: &Waker) -> bool {
-        self.shared.operations.arm(waker)
+    /// This method combines the operation-queue wake handshake with the next timer deadline so the
+    /// reactor cannot observe an empty queue before registering its wake. The reactor should poll
+    /// I/O once using the returned plan, dispatch ready I/O, and then call [`turn`](Self::turn)
+    /// again.
+    pub fn prepare_wait(&self, waker: &Waker) -> WaitPlan {
+        let next = self.wheel.next_poll_at(self.last_now);
+        if next.is_some_and(|deadline| deadline <= self.last_now) {
+            return WaitPlan::Immediate;
+        }
+
+        if !self.shared.operations.arm(waker) {
+            return WaitPlan::Immediate;
+        }
+
+        match next {
+            Some(deadline) => WaitPlan::Until(deadline),
+            None => WaitPlan::Indefinite,
+        }
     }
 
     /// Applies bounded operations and advances timers through `now`.
@@ -686,7 +798,7 @@ impl TimerService {
     ///
     /// Panics in debug builds when `now` is earlier than the previous observation. Panics in all
     /// builds when `now` is more than `u64::MAX` nanoseconds after the service's genesis.
-    pub fn turn(&mut self, now: Instant, budget: TurnBudget) -> TurnResult {
+    pub fn turn(&mut self, now: Instant, budget: TurnBudget) {
         debug_assert!(now >= self.last_now, "timer service cannot move backwards");
         let now = now.max(self.last_now);
         self.last_now = now;
@@ -732,12 +844,8 @@ impl TimerService {
             self.apply_step(step, now);
         }
 
-        let timer_more = self.wheel.has_due(now);
-        if !timer_more {
+        if !self.wheel.has_due(now) {
             self.wheel.settle(now);
-        }
-        TurnResult {
-            has_more_work: timer_more || self.shared.operations.is_pending(),
         }
     }
 
@@ -822,10 +930,15 @@ impl TimerService {
     }
 }
 
+impl Default for TimerService {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Drop for TimerService {
     fn drop(&mut self) {
         let (queued, reactor_waker) = self.shared.operations.close(&self.shared.closed);
-        drop(reactor_waker);
 
         let mut wakers = Vec::new();
         for state in self.wheel.drain() {
@@ -840,6 +953,9 @@ impl Drop for TimerService {
 
         // Dropping queued RegisterOps closes timers still in STATE_SUBMITTED.
         drop(queued);
+        // User-provided waker code may unwind. Run it only after every service-owned timer has
+        // reached a durable terminal state.
+        drop(reactor_waker);
     }
 }
 
@@ -858,7 +974,7 @@ impl Drop for TimerService {
 /// See the [module level documentation](self) for timer resolution and driving requirements.
 #[must_use = "futures do nothing unless you `.await` or poll them"]
 pub struct Delay {
-    context: TimerContext,
+    handle: TimerHandle,
     deadline: Deadline,
     closed: bool,
     fired_at: Option<Instant>,
@@ -892,7 +1008,7 @@ impl Delay {
                 let state = self.state.take().expect("polled delay must have state");
                 state.waker.clear();
                 let nanos = state.fired_nanos.load(Ordering::Relaxed);
-                self.fired_at = Some(self.context.shared.observed.decode(nanos));
+                self.fired_at = Some(self.handle.shared.observed.decode(nanos));
                 self.registered_waker = None;
                 Poll::Ready(Ok(()))
             }
@@ -924,12 +1040,12 @@ impl Future for Delay {
             return Poll::Ready(Err(TimerClosed));
         }
         if this.state.is_none() {
-            let now = this.context.now();
+            let now = this.handle.now();
             if this.is_elapsed_at(now) {
                 this.fired_at = Some(now);
                 return Poll::Ready(Ok(()));
             }
-            if this.context.shared.closed.load(Ordering::Acquire) {
+            if this.handle.shared.closed.load(Ordering::Acquire) {
                 this.closed = true;
                 return Poll::Ready(Err(TimerClosed));
             }
@@ -945,7 +1061,7 @@ impl Future for Delay {
                 deadline: this.deadline,
                 state: Some(state),
             });
-            if let Err(operation) = this.context.send(operation) {
+            if let Err(operation) = this.handle.send(operation) {
                 let Operation::Register(operation) = operation else {
                     unreachable!("a failed send must return the submitted operation")
                 };
@@ -1021,8 +1137,10 @@ impl Drop for Delay {
                         )
                         .is_ok()
                     {
+                        let _ = self.handle.send(Operation::Cancel(state.clone()));
+                        // Queue reclamation before running the user-provided waker destructor so a
+                        // panic cannot leave the cancelled entry linked indefinitely.
                         state.waker.clear();
-                        let _ = self.context.send(Operation::Cancel(state.clone()));
                         return;
                     }
                 }
@@ -1052,49 +1170,6 @@ impl fmt::Display for TimeoutError {
 }
 
 impl std::error::Error for TimeoutError {}
-
-/// Runs `future` until it completes or `duration` elapses.
-///
-/// The guarded future wins when both branches become ready in the same poll.
-///
-/// # Examples
-///
-/// ```
-/// use std::time::Duration;
-///
-/// use scorpio::time::TimerService;
-/// use scorpio::time::timeout;
-///
-/// let (_service, timer) = TimerService::new();
-///
-/// // The guarded future is polled first, so one that is already ready never arms a timer.
-/// let value = pollster::block_on(timeout(&timer, Duration::from_secs(1), async { 42 }));
-/// assert_eq!(value, Ok(42));
-/// ```
-pub async fn timeout<F>(
-    timer: &TimerContext,
-    duration: Duration,
-    future: F,
-) -> Result<F::Output, TimeoutError>
-where
-    F: Future,
-{
-    timeout_with_delay(timer.delay(duration), future).await
-}
-
-/// Runs `future` until it completes or `deadline` is reached.
-///
-/// The guarded future wins when both branches become ready in the same poll.
-pub async fn timeout_at<F>(
-    timer: &TimerContext,
-    deadline: Instant,
-    future: F,
-) -> Result<F::Output, TimeoutError>
-where
-    F: Future,
-{
-    timeout_with_delay(timer.delay_until(deadline), future).await
-}
 
 async fn timeout_with_delay<F>(delay: Delay, future: F) -> Result<F::Output, TimeoutError>
 where
@@ -1134,10 +1209,8 @@ pub enum MissedTickBehavior {
 #[must_use = "an interval advances only when tick is awaited"]
 pub struct Interval {
     behavior: MissedTickBehavior,
-    deadline: Deadline,
     delay: Delay,
     period: Duration,
-    timer: TimerContext,
 }
 
 impl Interval {
@@ -1150,11 +1223,12 @@ impl Interval {
         (&mut self.delay).await?;
         let observation = self.delay.completion_observation();
         let scheduled = self
+            .delay
             .deadline
             .as_instant()
             .expect("a never deadline cannot complete successfully");
-        self.deadline = self.next_deadline(scheduled, observation);
-        self.delay = self.timer.delay_to(self.deadline);
+        let next_deadline = self.next_deadline(scheduled, observation);
+        self.delay = self.delay.handle.delay_to(next_deadline);
         Ok(scheduled)
     }
 
@@ -1177,48 +1251,12 @@ impl Interval {
     }
 }
 
-/// Creates an interval with an immediate first tick.
-///
-/// # Panics
-///
-/// Panics when `period` is zero.
-///
-/// # Examples
-///
-/// ```
-/// use std::time::Duration;
-///
-/// use scorpio::time::TimerService;
-/// use scorpio::time::interval;
-///
-/// let (_service, timer) = TimerService::new();
-/// let mut ticks = interval(&timer, Duration::from_secs(1));
-///
-/// // The first tick is immediate, so it completes without a service turn.
-/// let scheduled_at = pollster::block_on(ticks.tick());
-/// assert!(scheduled_at.is_ok());
-/// ```
-pub fn interval(timer: &TimerContext, period: Duration) -> Interval {
-    interval_from_deadline(timer, Deadline::At(timer.now()), period)
-}
-
-/// Creates an interval whose first tick is scheduled at `start`.
-///
-/// # Panics
-///
-/// Panics when `period` is zero.
-pub fn interval_at(timer: &TimerContext, start: Instant, period: Duration) -> Interval {
-    interval_from_deadline(timer, Deadline::At(start), period)
-}
-
-fn interval_from_deadline(timer: &TimerContext, deadline: Deadline, period: Duration) -> Interval {
+fn interval_from_deadline(handle: &TimerHandle, deadline: Deadline, period: Duration) -> Interval {
     assert!(!period.is_zero(), "interval period must be non-zero");
     Interval {
         behavior: MissedTickBehavior::Burst,
-        deadline,
-        delay: timer.delay_to(deadline),
+        delay: handle.delay_to(deadline),
         period,
-        timer: timer.clone(),
     }
 }
 
@@ -1240,17 +1278,8 @@ fn skip_deadline(scheduled: Instant, period: Duration, observation: Instant) -> 
     Deadline::checked_add(scheduled, Duration::new(seconds, nanos))
 }
 
-/// Repeatedly runs `task`, waiting `delay` after each completion.
-///
-/// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
-/// closes.
-///
-/// # Panics
-///
-/// Panics when first polled if `delay` is zero.
-pub async fn schedule_with_fixed_delay<F>(
-    timer: &TimerContext,
+async fn schedule_with_fixed_delay<F>(
+    timer: TimerHandle,
     initial_delay: Option<Duration>,
     delay: Duration,
     mut task: F,
@@ -1268,21 +1297,8 @@ where
     }
 }
 
-/// Repeatedly runs `task` on a fixed grid, skipping missed invocations without overlap.
-///
-/// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
-/// closes.
-///
-/// A task that outruns its period does not cause the following invocations to run back to back.
-/// The next deadline is the first grid point strictly after the task completes, so the schedule
-/// stays aligned to the original grid and merely drops the invocations it missed.
-///
-/// # Panics
-///
-/// Panics when first polled if `period` is zero.
-pub async fn schedule_at_fixed_rate<F>(
-    timer: &TimerContext,
+async fn schedule_at_fixed_rate<F>(
+    timer: TimerHandle,
     initial_delay: Option<Duration>,
     period: Duration,
     mut task: F,
@@ -1310,14 +1326,8 @@ where
     }
 }
 
-/// Repeatedly runs `task`, using each returned instant as the next deadline.
-///
-/// `None` starts the first task immediately; `Some(duration)` delays the first invocation.
-/// Returning an elapsed instant repeatedly creates an intentionally busy loop.
-/// This future otherwise runs until it is dropped, returning [`TimerClosed`] only if the service
-/// closes.
-pub async fn schedule_with_arbitrary_delay<F>(
-    timer: &TimerContext,
+async fn schedule_with_arbitrary_delay<F>(
+    timer: TimerHandle,
     initial_delay: Option<Duration>,
     mut task: F,
 ) -> Result<(), TimerClosed>
