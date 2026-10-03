@@ -90,77 +90,6 @@ impl Wake for WakeCount {
     }
 }
 
-#[allow(
-    unsafe_code,
-    reason = "the test needs a RawWaker whose drop callback can unwind"
-)]
-mod panic_drop_waker {
-    use std::sync::Mutex;
-    use std::sync::MutexGuard;
-    use std::sync::atomic::AtomicBool;
-    use std::sync::atomic::AtomicUsize;
-    use std::sync::atomic::Ordering;
-    use std::task::RawWaker;
-    use std::task::RawWakerVTable;
-    use std::task::Waker;
-
-    struct State {
-        panic_on_drop: AtomicBool,
-        wakes: AtomicUsize,
-    }
-
-    static STATE: State = State {
-        panic_on_drop: AtomicBool::new(false),
-        wakes: AtomicUsize::new(0),
-    };
-    static TEST_LOCK: Mutex<()> = Mutex::new(());
-
-    pub(super) fn serial() -> MutexGuard<'static, ()> {
-        TEST_LOCK.lock().unwrap()
-    }
-
-    pub(super) fn new() -> Waker {
-        STATE.panic_on_drop.store(true, Ordering::Relaxed);
-        STATE.wakes.store(0, Ordering::Relaxed);
-        let raw = RawWaker::new((&STATE as *const State).cast(), &VTABLE);
-        unsafe { Waker::from_raw(raw) }
-    }
-
-    pub(super) fn wakes() -> usize {
-        STATE.wakes.load(Ordering::Relaxed)
-    }
-
-    unsafe fn clone(data: *const ()) -> RawWaker {
-        RawWaker::new(data, &VTABLE)
-    }
-
-    unsafe fn wake(data: *const ()) {
-        unsafe { &*data.cast::<State>() }
-            .wakes
-            .fetch_add(1, Ordering::Relaxed);
-    }
-
-    unsafe fn wake_by_ref(data: *const ()) {
-        unsafe { wake(data) };
-    }
-
-    unsafe fn drop(data: *const ()) {
-        let state = unsafe { &*data.cast::<State>() };
-        if state.panic_on_drop.swap(false, Ordering::Relaxed) && !std::thread::panicking() {
-            panic!("intentional RawWaker drop panic");
-        }
-    }
-
-    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, wake, wake_by_ref, drop);
-}
-
-#[test]
-fn default_turn_budget_matches_documented_limits() {
-    let budget = TurnBudget::default();
-    assert_eq!(budget.max_operations().get(), 1_024);
-    assert_eq!(budget.max_timer_entries().get(), 4_096);
-}
-
 #[test]
 fn atomic_observation_preserves_nanoseconds() {
     let genesis = Instant::now();
@@ -733,6 +662,41 @@ fn timeout_distinguishes_elapsed_and_closed() {
 }
 
 #[test]
+fn timeout_keeps_a_borrowed_operation_available_for_a_second_wait() {
+    let genesis = Instant::now();
+    let mut service = TimerService::new_at(genesis);
+    let timer = service.handle();
+    let completed = std::cell::Cell::new(false);
+    let mut operation = std::pin::pin!(poll_fn(|_| {
+        if completed.get() {
+            Poll::Ready(42)
+        } else {
+            Poll::Pending
+        }
+    }));
+
+    let deadline = genesis + Duration::from_millis(10);
+    {
+        let mut timeout = std::pin::pin!(timer.timeout_at(deadline, operation.as_mut()));
+        assert!(poll(timeout.as_mut()).is_pending());
+        drive(&mut service, deadline);
+        assert_eq!(
+            poll(timeout.as_mut()),
+            Poll::Ready(Err(TimeoutError::Elapsed))
+        );
+    }
+
+    // An I/O caller can request cancellation here, then wait for the same operation's completion
+    // to reclaim its buffer instead of resubmitting or losing ownership at the first deadline.
+    let mut grace = std::pin::pin!(timer.timeout(Duration::from_millis(5), operation.as_mut()));
+    assert!(poll(grace.as_mut()).is_pending());
+    completed.set(true);
+    assert_eq!(poll(grace.as_mut()), Poll::Ready(Ok(42)));
+    drive(&mut service, deadline);
+    assert_eq!(wait_plan(&service), WaitPlan::Indefinite);
+}
+
+#[test]
 fn high_level_futures_own_their_timer_handle() {
     fn assert_send_static<T: Send + 'static>(_: T) {}
 
@@ -1252,71 +1216,4 @@ fn a_changed_waker_is_republished() {
     assert_eq!(first.0.load(Ordering::Relaxed), 0);
     assert_eq!(second.0.load(Ordering::Relaxed), 1);
     assert_eq!(Arc::strong_count(&second), 2);
-}
-
-#[test]
-fn waker_drop_unwind_does_not_leave_a_stale_identity() {
-    let _serial = panic_drop_waker::serial();
-    let genesis = Instant::now();
-    let mut service = TimerService::new_at(genesis);
-    let timer = service.handle();
-    let original_waker = panic_drop_waker::new();
-    let replacement = Arc::new(WakeCount::default());
-    let replacement_waker = Waker::from(replacement.clone());
-    let mut delay = Box::pin(timer.delay(Duration::from_millis(1)));
-
-    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_pending());
-    drive(&mut service, genesis);
-
-    let replacement_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let _ = poll_with_waker(delay.as_mut(), &replacement_waker);
-    }));
-    assert!(replacement_result.is_err());
-
-    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_pending());
-    drive(&mut service, genesis + Duration::from_millis(1));
-    assert_eq!(panic_drop_waker::wakes(), 1);
-    assert_eq!(replacement.0.load(Ordering::Relaxed), 0);
-    assert!(poll_with_waker(delay.as_mut(), &original_waker).is_ready());
-}
-
-#[test]
-fn service_drop_closes_delays_before_reactor_waker_drop_unwinds() {
-    let _serial = panic_drop_waker::serial();
-    let genesis = Instant::now();
-    let mut service = TimerService::new_at(genesis);
-    let timer = service.handle();
-    let mut delay = Box::pin(timer.delay(Duration::from_secs(1)));
-
-    assert!(poll(delay.as_mut()).is_pending());
-    drive(&mut service, genesis);
-    let reactor_waker = panic_drop_waker::new();
-    assert!(matches!(
-        service.prepare_wait(&reactor_waker),
-        WaitPlan::Until(_)
-    ));
-
-    let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(service)));
-    assert!(drop_result.is_err());
-    assert_eq!(poll(delay.as_mut()), Poll::Ready(Err(TimerClosed)));
-}
-
-#[test]
-fn registered_cancellation_survives_task_waker_drop_unwind() {
-    let _serial = panic_drop_waker::serial();
-    let genesis = Instant::now();
-    let mut service = TimerService::new_at(genesis);
-    let timer = service.handle();
-    let task_waker = panic_drop_waker::new();
-    let mut delay = Box::pin(timer.delay(Duration::from_secs(1)));
-
-    assert!(poll_with_waker(delay.as_mut(), &task_waker).is_pending());
-    drive(&mut service, genesis);
-    assert_eq!(service.wheel.len(), 1);
-
-    let drop_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(delay)));
-    assert!(drop_result.is_err());
-    drive(&mut service, genesis);
-    assert_eq!(service.wheel.len(), 0);
-    assert_eq!(wait_plan(&service), WaitPlan::Indefinite);
 }

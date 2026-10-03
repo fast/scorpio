@@ -18,6 +18,25 @@
 //! loop calls [`TimerService::turn`] and [`TimerService::prepare_wait`]. Tasks receive a cloneable
 //! [`TimerHandle`] and create lazy [`Delay`] futures from it.
 //!
+//! # Libraries and shared services
+//!
+//! Libraries can accept a [`TimerHandle`] in their constructor and keep it beside their other
+//! dependencies. Handles and timer futures can move between executors: creating or polling a
+//! timer never requires entering a runtime. A handle does not keep the service alive or drive it.
+//!
+//! The application must retain and drive the service for as long as its libraries need timers.
+//! It can integrate the service into an existing reactor or explicitly start a timer thread and
+//! share handles with all its libraries. See the runnable
+//! [reactor](https://github.com/fast/scorpio/blob/main/scorpio/examples/custom_reactor.rs) and
+//! [shared service](https://github.com/fast/scorpio/blob/main/scorpio/examples/shared_timer.rs)
+//! examples. Each service is independent, including its deterministic clock from
+//! [`TimerService::new_at`], so tests need no global initialization or reset.
+//!
+//! A live service that is never turned leaves submitted timers pending; there is no automatic
+//! driver-liveness detection. Dropping the service wakes pending delays with [`TimerClosed`] and
+//! timeouts with [`TimeoutError::Closed`]. Stop library work before stopping the driver when
+//! orderly completion is required. See [`Delay`] for already-elapsed and completed timers.
+//!
 //! # Reactor contract
 //!
 //! After each timer turn, the integrating event loop calls [`TimerService::prepare_wait`] once and
@@ -25,6 +44,11 @@
 //! not block. After dispatching ready I/O, the loop calls `turn` again. `prepare_wait` registers
 //! the reactor waker and chooses the timer deadline as one operation, so callers cannot introduce a
 //! lost-wakeup window by performing those steps in the wrong order.
+//! The reactor's wait primitive must retain notifications delivered before it starts waiting
+//! (as `thread::unpark` does); a bare, unlatched notification can still lose a wake.
+//!
+//! Executor waker operations are expected not to panic. Normal waker cloning may occur inside a
+//! short critical section; wake callbacks and replaced waker destruction run outside locks.
 //!
 //! # Operation backlog and cancellation
 //!
@@ -227,9 +251,6 @@ impl OperationQueue {
     }
 
     fn arm(&self, waker: &Waker) -> bool {
-        // Clone before locking because a custom RawWaker vtable may panic. Replaced wakers are also
-        // dropped after unlocking so no user-provided vtable code runs in the queue critical path.
-        let mut replacement = Some(waker.clone());
         let (armed, previous) = {
             let mut inner = self.inner.lock().unwrap();
             if !inner.operations.is_empty() || !inner.accepting {
@@ -241,16 +262,10 @@ impl OperationQueue {
             {
                 (true, None)
             } else {
-                (
-                    true,
-                    inner
-                        .reactor_waker
-                        .replace(replacement.take().expect("replacement waker must exist")),
-                )
+                (true, inner.reactor_waker.replace(waker.clone()))
             }
         };
         drop(previous);
-        drop(replacement);
         armed
     }
 
@@ -548,6 +563,10 @@ enum Operation {
 
 /// A cheap-to-clone handle for creating timers from tasks.
 ///
+/// Pass this handle to libraries that need timers. It neither drives nor keeps alive its
+/// [`TimerService`]; the application owns that lifecycle. Timers need no current runtime and can
+/// be polled on any executor.
+///
 /// See the [module level documentation](self) for the service and reactor integration model.
 #[derive(Clone)]
 pub struct TimerHandle {
@@ -584,9 +603,18 @@ impl TimerHandle {
 
     /// Runs `future` until it completes or `duration` elapses.
     ///
-    /// The guarded future wins when both branches become ready in the same poll. The returned
+    /// The duration starts when this method is called. The guarded future is polled first and wins
+    /// when both branches are ready; a poll that does not yield cannot be interrupted. The returned
     /// future owns a timer handle and can therefore cross a `'static` task boundary when `future`
     /// can.
+    ///
+    /// # Cancellation
+    ///
+    /// Completing or dropping the timeout drops the supplied future. Pass `&mut future` (when
+    /// `Unpin`) or `Pin<&mut F>` to retain the underlying operation for cancellation and a second
+    /// wait. Dropping a future does not itself cancel external I/O; that is the operation's
+    /// contract. Service shutdown returns [`TimeoutError::Closed`], distinct from an elapsed
+    /// deadline.
     pub fn timeout<F>(
         &self,
         duration: Duration,
@@ -600,7 +628,9 @@ impl TimerHandle {
 
     /// Runs `future` until it completes or `deadline` is reached.
     ///
-    /// The guarded future wins when both branches become ready in the same poll.
+    /// Use the same absolute deadline across multiple stages to preserve an overall time limit.
+    /// The polling order, ownership, and cancellation rules are the same as
+    /// [`timeout`](Self::timeout).
     pub fn timeout_at<F>(
         &self,
         deadline: Instant,
@@ -708,7 +738,12 @@ impl TimerHandle {
 /// [`turn`](Self::turn), then obtains an atomic parking decision through
 /// [`prepare_wait`](Self::prepare_wait).
 ///
+/// Keep the service alive and continuously drive it while tasks use its handles. Dropping it
+/// closes pending timers even if handles survive; retaining it without driving it leaves them
+/// pending. There is no background fallback.
+///
 /// See the [module level documentation](self) for the complete reactor contract.
+#[must_use = "a timer service must be retained and driven to make pending timers progress"]
 pub struct TimerService {
     last_now: Instant,
     operation_batch: VecDeque<Operation>,

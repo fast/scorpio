@@ -12,23 +12,26 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
+//! Drive a root future and timers on one application-owned reactor thread.
+//!
+//! An I/O reactor uses its own poller in place of parking below. Its notification must be latched:
+//! a wake delivered between `prepare_wait` and the blocking wait must make that wait return.
+
+use std::future::Future;
 use std::sync::Arc;
-use std::sync::mpsc;
+use std::task::Context;
+use std::task::Poll;
 use std::task::Wake;
 use std::task::Waker;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use scorpio::time::TimerClosed;
 use scorpio::time::TimerHandle;
 use scorpio::time::TimerService;
 use scorpio::time::TurnBudget;
 use scorpio::time::WaitPlan;
-
-#[derive(Clone)]
-struct AppContext {
-    timer: TimerHandle,
-}
 
 struct ThreadWake(thread::Thread);
 
@@ -38,41 +41,27 @@ impl Wake for ThreadWake {
     }
 }
 
-async fn application_task(context: AppContext) {
-    context
-        .timer
-        .delay(Duration::from_millis(10))
-        .await
-        .expect("the reactor keeps the timer service alive");
+async fn application_task(timer: TimerHandle) -> Result<(), TimerClosed> {
+    timer.delay(Duration::from_millis(10)).await
 }
 
-fn main() {
-    let service = TimerService::new();
-    let context = AppContext {
-        timer: service.handle(),
-    };
-    let (stop_tx, stop_rx) = mpsc::channel();
+fn main() -> Result<(), TimerClosed> {
+    let mut service = TimerService::new();
+    let mut task = std::pin::pin!(application_task(service.handle()));
+    let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
+    let mut cx = Context::from_waker(&waker);
 
-    let reactor = thread::spawn(move || {
-        let mut service = service;
-        let waker = Waker::from(Arc::new(ThreadWake(thread::current())));
-        loop {
-            service.turn(Instant::now(), TurnBudget::default());
-            if stop_rx.try_recv().is_ok() {
-                break;
-            }
-            match service.prepare_wait(&waker) {
-                WaitPlan::Immediate => thread::yield_now(),
-                WaitPlan::Until(deadline) => {
-                    thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
-                }
-                WaitPlan::Indefinite => thread::park(),
-            }
+    loop {
+        service.turn(Instant::now(), TurnBudget::default());
+        if let Poll::Ready(result) = task.as_mut().poll(&mut cx) {
+            return result;
         }
-    });
-
-    pollster::block_on(application_task(context));
-    stop_tx.send(()).unwrap();
-    reactor.thread().unpark();
-    reactor.join().unwrap();
+        match service.prepare_wait(&waker) {
+            WaitPlan::Immediate => {}
+            WaitPlan::Until(deadline) => {
+                thread::park_timeout(deadline.saturating_duration_since(Instant::now()));
+            }
+            WaitPlan::Indefinite => thread::park(),
+        }
+    }
 }
