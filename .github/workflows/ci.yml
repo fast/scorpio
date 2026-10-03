@@ -48,6 +48,10 @@ jobs:
         with:
           tool: typos-cli,taplo-cli,hawkeye
       - run: cargo x lint
+      - run: cargo x build --locked
+      - run: cargo x bench --quick
+      - name: Check committed lockfile
+        run: git diff --exit-code -- Cargo.lock
 
   msrv:
     name: Resolve MSRV
@@ -73,16 +77,16 @@ jobs:
         rust-version: ${{ fromJson(needs.msrv.outputs.rust-versions) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    env:
+      RUSTUP_TOOLCHAIN: ${{ matrix.rust-version }}
     steps:
       - uses: actions/checkout@v7
-      - uses: Swatinem/rust-cache@v2
-      - name: Delete rust-toolchain.toml
-        run: rm rust-toolchain.toml
       - name: Install toolchain
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: ${{ matrix.rust-version }}
-      - name: Run unit tests
+      - uses: Swatinem/rust-cache@v2
+      - name: Run tests and timer integrations
         run: cargo x test --no-capture
         shell: bash
 

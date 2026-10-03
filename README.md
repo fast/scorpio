@@ -16,7 +16,34 @@
 [actions-badge]: https://github.com/fast/scorpio/actions/workflows/ci.yml/badge.svg
 [actions-url]: https://github.com/fast/scorpio/actions/workflows/ci.yml
 
-A scheduler independent asynchronous context.
+A scheduler-independent set of asynchronous capabilities.
+
+Scorpio starts no thread and installs no global or thread-local runtime. The application owns a `TimerService` and passes its cloneable `TimerHandle` to libraries and tasks. A handle can be used with any executor; the application must keep driving its service.
+
+```rust
+use std::time::Duration;
+
+use scorpio::time::TimerClosed;
+use scorpio::time::TimerHandle;
+
+// A library receives the capability from its caller.
+async fn retry_after(timer: &TimerHandle, backoff: Duration) -> Result<(), TimerClosed> {
+    timer.delay(backoff).await
+}
+```
+
+Choose how the application drives timers:
+
+- [Custom reactor](https://github.com/fast/scorpio/blob/main/examples/src/custom_reactor.rs): turn the service and apply `prepare_wait` in an existing event loop.
+- [Shared timer](https://github.com/fast/scorpio/blob/main/examples/src/shared_timer.rs): explicitly own one timer thread, share handles between libraries, and stop and join it at shutdown.
+
+Run either with `cargo run -p examples --example <name>`. A live but undriven service leaves submitted timers pending; dropping it wakes them with a closure error. Handles do not keep it alive. Timeouts distinguish service closure from an elapsed deadline, and borrowed operations can be retained for cancellation and a second wait.
+
+The ownership and timing-wheel tradeoffs are documented in [Timer service and handle design](https://github.com/fast/scorpio/blob/main/docs/timer-design.md). Run `cargo x bench --quick` for benchmark smoke checks, or `cargo x bench [FILTER]` for Divan measurements.
+
+## Acknowledgements
+
+The initial `time` module is adapted from [fast/mea#137](https://github.com/fast/mea/pull/137), authored by [Orthur](https://github.com/orthur2) (`Orthur <orthur2@gmail.com>`, original commit [`5476e10`](https://github.com/fast/mea/commit/5476e1006fc80729f8e646f70aba1091fde72386)).
 
 ## Minimum Rust version policy
 

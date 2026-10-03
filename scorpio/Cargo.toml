@@ -16,7 +16,10 @@
 name = "scorpio"
 version = "0.0.1"
 
-description = "A scheduler independent asynchronous context."
+categories = ["asynchronous", "concurrency"]
+description = "Scheduler-independent asynchronous capabilities."
+documentation = "https://docs.rs/scorpio"
+keywords = ["async", "timer", "timeout", "runtime-agnostic"]
 
 edition.workspace = true
 homepage.workspace = true
@@ -30,12 +33,7 @@ all-features = true
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
-mea = { version = "0.6.5" }
-slab = { version = "0.4.11" }
-
-[dev-dependencies]
-loom = { version = "0.7.2" }
-pollster = { version = "1.0.1" }
+slab = { workspace = true }
 
 [lints]
 workspace = true
