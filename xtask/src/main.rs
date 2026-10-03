@@ -50,7 +50,7 @@ enum SubCommand {
     Build(CommandBuild),
     #[clap(about = "Run workspace quality checks.")]
     Lint(CommandLint),
-    #[clap(about = "Run workspace unit tests.")]
+    #[clap(about = "Run workspace tests and timer integration examples.")]
     Test(CommandTest),
 }
 
@@ -101,13 +101,18 @@ impl CommandBuild {
 
 #[derive(Parser)]
 struct CommandTest {
-    #[arg(long, help = "Run tests serially and do not capture output.")]
+    #[arg(long, help = "Do not capture test output.")]
     no_capture: bool,
 }
 
 impl CommandTest {
     fn run(self) {
         run_command(make_test_cmd(self.no_capture, &[]));
+        for example in ["custom_reactor", "shared_timer"] {
+            let mut cmd = find_command("cargo");
+            cmd.args(["run", "--package", "scorpio", "--example", example]);
+            run_command(cmd);
+        }
     }
 }
 

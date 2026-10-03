@@ -16,7 +16,10 @@
 name = "scorpio"
 version = "0.0.1"
 
+categories = ["asynchronous", "concurrency"]
 description = "Scheduler-independent asynchronous capabilities."
+documentation = "https://docs.rs/scorpio"
+keywords = ["async", "timer", "timeout", "runtime-agnostic"]
 
 edition.workspace = true
 homepage.workspace = true
