@@ -27,8 +27,8 @@
 //! The application must retain and drive the service for as long as its libraries need timers.
 //! It can integrate the service into an existing reactor or explicitly start a timer thread and
 //! share handles with all its libraries. See the runnable
-//! [reactor](https://github.com/fast/scorpio/blob/main/scorpio/examples/custom_reactor.rs) and
-//! [shared service](https://github.com/fast/scorpio/blob/main/scorpio/examples/shared_timer.rs)
+//! [reactor](https://github.com/fast/scorpio/blob/main/examples/src/custom_reactor.rs) and
+//! [shared service](https://github.com/fast/scorpio/blob/main/examples/src/shared_timer.rs)
 //! examples. Each service is independent, including its deterministic clock from
 //! [`TimerService::new_at`], so tests need no global initialization or reset.
 //!

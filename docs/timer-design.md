@@ -22,7 +22,7 @@ At that snapshot Cache2 requires Tokio 1.53.1 with `rt` and `time`, has a Rust 1
 
 ## Shared service lifecycle
 
-One service created by application startup can serve libraries on multiple executors. The [shared timer example](../scorpio/examples/shared_timer.rs) keeps the thread, stop signal, and join handle in application state. Its clients receive only `TimerHandle`. The [custom reactor example](../scorpio/examples/custom_reactor.rs) instead drives a root future and the timer service on the caller's thread. Both use the same `turn` / `prepare_wait` protocol and a latched wake, so a notification just before parking is retained.
+One service created by application startup can serve libraries on multiple executors. The [shared timer example](../examples/src/shared_timer.rs) keeps the thread, stop signal, and join handle in application state. Its clients receive only `TimerHandle`. The [custom reactor example](../examples/src/custom_reactor.rs) instead drives a root future and the timer service on the caller's thread. Both use the same `turn` / `prepare_wait` protocol and a latched wake, so a notification just before parking is retained.
 
 There is no built-in global service, thread-spawning constructor, or feature that silently enables one. A static singleton generally lives until process exit, complicates shutdown and test isolation, and cannot express which application or runtime owns the driver. Applications may still deliberately publish a handle through their own global state, while retaining an explicit owner and shutdown policy. Creating a handle never creates a hidden thread. No feature flag is needed for the crate's only current capability.
 

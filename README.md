@@ -34,10 +34,10 @@ async fn retry_after(timer: &TimerHandle, backoff: Duration) -> Result<(), Timer
 
 Choose how the application drives timers:
 
-- [Custom reactor](https://github.com/fast/scorpio/blob/main/scorpio/examples/custom_reactor.rs): turn the service and apply `prepare_wait` in an existing event loop.
-- [Shared timer](https://github.com/fast/scorpio/blob/main/scorpio/examples/shared_timer.rs): explicitly own one timer thread, share handles between libraries, and stop and join it at shutdown.
+- [Custom reactor](https://github.com/fast/scorpio/blob/main/examples/src/custom_reactor.rs): turn the service and apply `prepare_wait` in an existing event loop.
+- [Shared timer](https://github.com/fast/scorpio/blob/main/examples/src/shared_timer.rs): explicitly own one timer thread, share handles between libraries, and stop and join it at shutdown.
 
-Run either with `cargo run -p scorpio --example <name>`. A live but undriven service leaves submitted timers pending; dropping it wakes them with a closure error. Handles do not keep it alive. Timeouts distinguish service closure from an elapsed deadline, and borrowed operations can be retained for cancellation and a second wait.
+Run either with `cargo run -p examples --example <name>`. A live but undriven service leaves submitted timers pending; dropping it wakes them with a closure error. Handles do not keep it alive. Timeouts distinguish service closure from an elapsed deadline, and borrowed operations can be retained for cancellation and a second wait.
 
 The ownership and timing-wheel tradeoffs are documented in [Timer service and handle design](https://github.com/fast/scorpio/blob/main/docs/timer-design.md). Run `cargo x bench --quick` for benchmark smoke checks, or `cargo x bench [FILTER]` for Divan measurements.
 

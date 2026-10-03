@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [package]
-name = "x"
+name = "benchmarks"
 publish = false
 
 edition.workspace = true
@@ -22,9 +22,16 @@ rust-version.workspace = true
 [package.metadata.release]
 release = false
 
-[dependencies]
-clap = { workspace = true }
-which = { workspace = true }
+[dev-dependencies]
+async-io = { workspace = true }
+divan = { workspace = true }
+futures-timer = { workspace = true }
+scorpio = { workspace = true }
+tokio = { workspace = true, features = ["rt", "time"] }
+
+[[bench]]
+harness = false
+name = "timer"
 
 [lints]
 workspace = true

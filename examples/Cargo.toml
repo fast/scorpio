@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [package]
-name = "x"
+name = "examples"
 publish = false
 
 edition.workspace = true
@@ -23,8 +23,16 @@ rust-version.workspace = true
 release = false
 
 [dependencies]
-clap = { workspace = true }
-which = { workspace = true }
+pollster = { workspace = true }
+scorpio = { workspace = true }
+
+[[example]]
+name = "custom_reactor"
+path = "src/custom_reactor.rs"
+
+[[example]]
+name = "shared_timer"
+path = "src/shared_timer.rs"
 
 [lints]
 workspace = true

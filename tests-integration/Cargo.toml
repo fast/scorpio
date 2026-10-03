@@ -13,7 +13,7 @@
 # limitations under the License.
 
 [package]
-name = "x"
+name = "tests-integration"
 publish = false
 
 edition.workspace = true
@@ -22,9 +22,9 @@ rust-version.workspace = true
 [package.metadata.release]
 release = false
 
-[dependencies]
-clap = { workspace = true }
-which = { workspace = true }
+[dev-dependencies]
+pollster = { workspace = true }
+scorpio = { workspace = true }
 
 [lints]
 workspace = true

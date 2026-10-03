@@ -110,7 +110,7 @@ impl CommandTest {
         run_command(make_test_cmd(self.no_capture, &[]));
         for example in ["custom_reactor", "shared_timer"] {
             let mut cmd = find_command("cargo");
-            cmd.args(["run", "--package", "scorpio", "--example", example]);
+            cmd.args(["run", "--package", "examples", "--example", example]);
             run_command(cmd);
         }
     }
@@ -180,7 +180,7 @@ fn make_build_cmd(locked: bool) -> StdCommand {
 
 fn make_bench_cmd(filter: Option<&str>, quick: bool) -> StdCommand {
     let mut cmd = find_command("cargo");
-    cmd.args(["bench", "--workspace", "--bench", "timer", "--"]);
+    cmd.args(["bench", "--package", "benchmarks", "--bench", "timer", "--"]);
     if let Some(filter) = filter {
         cmd.arg(filter);
     }
